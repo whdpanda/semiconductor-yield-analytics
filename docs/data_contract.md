@@ -1,0 +1,210 @@
+# Data Contract
+
+This document defines how each dataset is obtained, what its raw schema looks like,
+and what the processed output format is. It is the single source of truth for data
+placement and schema conventions across the project.
+
+---
+
+## Module A: WM-811K Wafer Map Dataset
+
+### Obtaining the Data
+
+**The WM-811K pkl file is NOT bundled with this repository.** You must download it manually.
+
+| Step | Action |
+|------|--------|
+| 1 | Create a free Kaggle account at https://www.kaggle.com |
+| 2 | Go to https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map |
+| 3 | Download `LSWMD.pkl` (~350 MB) |
+| 4 | Place the file at `data/raw/wm811k/LSWMD.pkl` |
+
+The loader (`src/semiconductor_yield/wafer/data_loader.py`) will raise a clear
+`FileNotFoundError` with the above instructions if the file is missing.
+
+### Supported Input Format
+
+The loader supports:
+- The standard Kaggle download: `LSWMD.pkl` (a pickled pandas DataFrame)
+- Any file producible by `pandas.DataFrame.to_pickle()` with the schema below
+
+Other formats (CSV, npz) are **not** supported by `WM811KLoader` and require a custom loader.
+
+### Raw Schema
+
+The pkl file contains a pandas DataFrame with one row per wafer:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `waferMap` | ndarray (variable shape) | 2D array; values: 0=background, 1=good die, 2=bad die |
+| `dieSize` | float | Physical die size (arbitrary units) |
+| `lotName` | str | Lot identifier string |
+| `waferIndex` | int | Wafer position within the lot |
+| `trianTestLabel` | list[str] | `['Training']` or `['Test']` — the original dataset split |
+| `failureType` | list[list[str]] | Nested list format, e.g. `[['Center']]`, `[['']]` for unlabeled |
+
+**Note on `trianTestLabel` spelling:** The column name contains a typo in the original
+dataset (`trian` instead of `train`). The loader handles this correctly.
+
+**Note on `failureType` format:** The value `[['']]` (empty string) means the wafer is
+unlabeled — not that it has no defect. By default the loader discards unlabeled wafers.
+
+### Class Distribution (labeled subset, ~172k of 811k wafers)
+
+| Class | Approx. Count | Approx. % |
+|-------|---------------|-----------|
+| none | 147,431 | ~79% |
+| Edge-Ring | 9,680 | ~5.2% |
+| Edge-Loc | 5,189 | ~2.8% |
+| Center | 4,294 | ~2.3% |
+| Local | 3,593 | ~1.9% |
+| Random | 866 | ~0.5% |
+| Scratch | 1,193 | ~0.6% |
+| Donut | 555 | ~0.3% |
+| Near-Full | 149 | ~0.08% |
+
+**Class imbalance note:** The `none` class dominates at ~79%. Accuracy is a misleading
+metric here. The project uses Macro F1 as the primary evaluation metric.
+
+### Processed Output Format
+
+After running the preprocessing stage, the following files are written to
+`data/processed/wafer_maps/`:
+
+| File | Contents |
+|------|----------|
+| `train.npz` | `maps`: float32 array (N, 64, 64); `labels`: int32 array (N,) |
+| `val.npz` | Same structure |
+| `test.npz` | Same structure |
+| `label_map.json` | `{"Center": 0, "Donut": 1, ..., "none": 8}` |
+
+Maps are resized to 64×64 using nearest-neighbour interpolation (to preserve
+the discrete 0/1/2 values — bilinear or bicubic resampling would corrupt them).
+
+---
+
+## Module B: UCI SECOM Dataset (Optional)
+
+### Important Disclaimer on Feature Anonymization
+
+> **SECOM features are fully anonymized.** The dataset contains 590 sensor readings
+> labeled only as `Feature_0` through `Feature_589`. There is **no public mapping**
+> from these anonymous indices to real process steps (lithography, etch, deposition, etc.).
+>
+> **Do not claim in any report, README, or interview that SECOM Feature_N corresponds to
+> a specific process parameter.** Such a claim would be fabricated and professionally misleading.
+>
+> SECOM is used in this project only to demonstrate that the data loading and preprocessing
+> pipeline can handle a real-world dataset with high missing rates and binary labels.
+> All process-parameter interpretation is done exclusively with the synthetic dataset.
+
+### Obtaining the Data
+
+```bash
+python scripts/download_data.py --dataset secom
+```
+
+Files are saved to `data/raw/secom/`:
+- `secom.data` — 1,567 rows × 590 anonymous features (space-separated, NaN as `NaN`)
+- `secom_labels.data` — 1,567 rows × 2 columns (label: -1 normal / 1 fail; timestamp)
+
+### SECOM Schema
+
+| Attribute | Value |
+|-----------|-------|
+| Samples | 1,567 |
+| Features | 590 (anonymous sensors) |
+| Label | Binary: -1 (pass) / 1 (fail) |
+| Fail rate | ~6.5% |
+| Missing rate | ~5–15% per feature |
+| License | UCI ML Repository terms of use |
+
+### Limitations
+
+- Only 1,567 samples — too few for reliable deep learning; suitable only for classical ML
+- Features are anonymous — prevents any domain-informed feature engineering
+- Not suitable as the primary dataset for demonstrating process knowledge
+
+---
+
+## Module B: Synthetic Process Dataset
+
+### Overview
+
+The synthetic dataset is generated by `SyntheticProcessDataGenerator`
+in `src/semiconductor_yield/process/synthetic.py`. It is the **primary** dataset
+for Module B because:
+
+1. Its schema carries real process semantics (temperature, rf_power, film_thickness, etc.)
+2. Anomalies are injected with known ground truth, enabling quantitative evaluation
+3. It can be regenerated at any time with a fixed seed for reproducibility
+
+**All values are drawn from statistical distributions — not from real equipment measurements.**
+
+### Generating the Data
+
+```bash
+python scripts/generate_synthetic_process_data.py
+# Output: data/synthetic/process_data.csv
+```
+
+Options:
+```
+--n-lots       Number of lots (default: 50)
+--n-wafers     Wafers per lot (default: 25)
+--seed         Random seed (default: 42)
+--anomaly-rate Target anomaly fraction (default: 0.05)
+--output       Custom output path
+```
+
+### Output Schema
+
+One row per (lot × wafer × process_step) combination.
+
+| Column | Type | Unit | Description |
+|--------|------|------|-------------|
+| `lot_id` | str | — | Lot identifier, e.g. `LOT_0001` |
+| `wafer_id` | str | — | Wafer identifier within lot, e.g. `W_001` |
+| `timestamp` | datetime64 | — | Simulated measurement timestamp |
+| `process_step` | str | — | One of: Lithography, Etching, Deposition, CMP, Metrology |
+| `temperature` | float | °C | Chamber / environment temperature |
+| `pressure` | float | mTorr | Process chamber pressure |
+| `gas_flow` | float | sccm | Process gas flow rate (NaN for non-plasma steps) |
+| `rf_power` | float | W | RF power applied (NaN for non-plasma steps) |
+| `exposure_dose` | float | mJ/cm² | Lithography exposure dose (NaN for non-litho steps) |
+| `film_thickness` | float | Å | Deposited or removed film thickness (NaN for Lithography) |
+| `overlay_error` | float | nm | Alignment error (applicable to Lithography and Metrology only) |
+| `defect_density` | float | defects/cm² | In-line defect inspection result |
+| `yield_rate` | float | — | Simulated die yield (0–1); reduced for anomalous rows |
+| `anomaly_label` | bool | — | Ground truth: True if any anomaly was injected |
+| `anomaly_type` | str | — | One of: normal, drift, spike, step_shift, tool_offset |
+| `suspected_root_cause` | str | — | Rule-based RCA hint corresponding to anomaly_type |
+
+**NaN convention:** A NaN value means the parameter is not applicable for the current
+process step (e.g., `rf_power` is NaN for Lithography). NaN ≠ missing data.
+
+### Injected Anomaly Patterns
+
+| Type | Affected Parameter | Injection Strategy |
+|------|-------------------|-------------------|
+| `drift` | temperature | Gradual +6 °C drift in the last 20% of lots |
+| `step_shift` | rf_power (Etching) | Permanent +2.5σ step from lot 70% onwards |
+| `spike` | temperature | Random ~1.5% of rows spiked to ±5σ |
+| `tool_offset` | temperature (Deposition) | First 8% of lots have a +2σ systematic offset |
+
+Ground truth anomaly labels enable rigorous evaluation of detection methods:
+SPC violations, Isolation Forest anomaly scores, and Autoencoder reconstruction errors
+can all be benchmarked against the known injection events.
+
+### Nominal Parameter Values Per Step
+
+| Step | Temperature (°C) | Pressure (mTorr) | RF Power (W) |
+|------|-----------------|-----------------|-------------|
+| Lithography | 23 ± 0.3 | 760,000 ± 500 | N/A |
+| Etching | 60 ± 3 | 10 ± 0.8 | 500 ± 15 |
+| Deposition | 400 ± 8 | 5 ± 0.3 | 300 ± 12 |
+| CMP | 25 ± 2 | 3,000 ± 100 | N/A |
+| Metrology | 23 ± 0.5 | 760,000 ± 300 | N/A |
+
+These values are chosen to be plausible for 300mm CMOS fabrication but are
+**not calibrated to any specific equipment or process node**.

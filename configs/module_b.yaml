@@ -1,0 +1,64 @@
+# Module B: SPC + Process Anomaly Detection — pipeline configuration
+
+data:
+  source: "synthetic"           # options: synthetic, secom
+  synthetic_path: "data/synthetic/spc_with_anomalies.csv"
+  secom_dir: "data/raw/secom"
+  processed_dir: "data/processed/spc"
+  random_seed: 42
+
+synthetic_generation:
+  n_samples: 5000
+  n_features: 8
+  anomaly_rate: 0.05            # 5% of samples contain injected anomalies
+  anomaly_types:
+    - mean_shift
+    - variance_increase
+    - trend
+    - spike
+  feature_names:
+    - etch_rate
+    - deposition_thickness
+    - chamber_temp
+    - chamber_pressure
+    - rf_power
+    - gas_flow_rate
+    - bias_voltage
+    - substrate_rotation
+
+preprocessing:
+  missing_value_strategy: "median"
+  correlation_threshold: 0.95   # drop features with correlation above this
+  scaler: "standard"            # options: standard, minmax, robust
+
+spc:
+  control_limit_sigma: 3.0
+  warning_limit_sigma: 2.0
+  subgroup_size: 5              # for X-bar / R charts
+  ewma_lambda: 0.2
+  baseline_fraction: 0.30       # first 30% of data used to estimate control limits
+
+anomaly_detection:
+  isolation_forest:
+    n_estimators: 200
+    contamination: 0.05
+    random_state: 42
+  autoencoder:
+    hidden_dims: [32, 16, 8, 16, 32]
+    latent_dim: 4
+    epochs: 50
+    batch_size: 128
+    learning_rate: 1.0e-3
+    reconstruction_threshold_percentile: 95
+
+ensemble:
+  strategy: "any"               # options: any (OR), majority (>=2 of 3), all (AND)
+  weights:
+    spc: 1
+    isolation_forest: 1
+    autoencoder: 1
+
+output:
+  report_dir: "outputs/reports"
+  model_dir: "outputs/models"
+  log_dir: "outputs/logs"

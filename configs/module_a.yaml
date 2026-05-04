@@ -1,0 +1,39 @@
+# Module A: Wafer Map Defect Classification — training configuration
+
+data:
+  raw_pkl: "data/raw/wm811k/LSWMD.pkl"
+  processed_dir: "data/processed/wafer_maps"
+  wafer_map_size: [64, 64]
+  train_ratio: 0.70
+  val_ratio:   0.15
+  test_ratio:  0.15
+  random_seed: 42
+
+model:
+  architecture: "resnet18"      # options: resnet18, efficientnet_b0
+  pretrained: true
+  num_classes: 9
+  input_channels: 1             # wafer maps are single-channel
+
+training:
+  epochs: 50
+  batch_size: 64
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: "adam"             # options: adam, sgd
+  scheduler: "cosine"           # options: cosine, step, none
+  early_stopping_patience: 10
+  loss: "focal"                 # options: focal, cross_entropy_weighted
+  focal_gamma: 2.0
+
+augmentation:
+  random_horizontal_flip: true
+  random_vertical_flip: true
+  random_rotation_degrees: 90   # wafer maps have rotational symmetry
+  gaussian_noise_std: 0.02
+
+output:
+  checkpoint_dir: "outputs/models"
+  report_dir: "outputs/reports"
+  log_dir: "outputs/logs"
+  save_top_k: 1                 # keep only the best checkpoint
