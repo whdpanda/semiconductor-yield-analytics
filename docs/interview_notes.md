@@ -140,6 +140,68 @@ Several design choices make model behavior interpretable and auditable:
 
 ---
 
+## RCA Candidate Analysis: How to Present It in an Interview
+
+### What the module does
+
+The `rca.py` module produces ranked **root cause candidates** — not confirmed diagnoses.
+Given SPC violations, anomaly detector outputs, and process-step feature semantics, it:
+
+1. Groups anomalous features by the process step they belong to.
+2. Assigns a suspicion score based on: number of violated features, SPC violation count,
+   anomaly fraction at that step, and whether step-discriminating features (e.g. `rf_power`
+   for Etching, `exposure_dose` for Lithography) are involved.
+3. Applies a confidence level (`low` / `medium` / `high`) that reflects breadth of evidence
+   — not probability of being the true root cause.
+4. Always emits a `limitation_note` on every candidate to make the scope explicit.
+
+### Key language to use
+
+- "The system surfaces **candidates** based on statistical co-occurrence. In this run,
+  Etching ranks highest because rf_power and gas_flow — both Etching-discriminating features
+  — had multiple SPC violations *and* the anomaly detector flagged 15% of Etching rows."
+- "Confidence 'high' means the evidence is broad — SPC and ML agree, multiple features
+  are co-anomalous at the same step — not that we are certain about the cause."
+- "The next step is **切り分け** (triage): an engineer checks the RF power supply calibration
+  log for the affected lots. If the log shows no excursion, Etching is deprioritized and we
+  look at the next candidate."
+
+### Why it is NOT a final root cause judgment
+
+Real fab RCA requires layers that are outside this system's scope:
+
+1. **Recipe audit:** Was the target rf_power or gas_flow recipe changed around the flagged
+   period? A recipe change is a common explanation that no sensor anomaly analysis can see.
+2. **Equipment tool log (EES/FDC):** The tool logs process traces at millisecond resolution.
+   Statistical SPC operates on lot-level aggregates — it can miss sub-lot transients that
+   the FDC system would catch.
+3. **Consumable change records:** Etch rate drift often correlates with electrode or focus
+   ring wear cycles. This information lives in the maintenance MES, not the sensor stream.
+4. **Engineer domain review:** Process engineers carry implicit knowledge about which
+   anomaly patterns are real vs. measurement artifact. No rule system can replicate that.
+
+### Demonstrating manufacturing safety awareness
+
+Articulating these limitations explicitly shows the interviewer that you understand the
+*workflow* of a fab, not just the ML stack:
+
+> "In a real fab, a tool hold is an expensive decision — downtime can cost $5k–$10k/hour.
+> This module is designed to *direct* the engineer's attention, not to make the hold decision.
+> That's why every output carries a limitation note and uses the word 'candidate' throughout.
+> If I were deploying this in production, I would add a confirmation gate: the system can
+> open an investigation ticket in the FMEA/ECM system, but only a credentialed engineer can
+> close it with a root cause code."
+
+### SECOM anonymous mode
+
+When the data source is SECOM, the module suppresses all known fab step names because the
+SECOM feature names are anonymized — claiming "Etching is the root cause" from anonymous
+features would be fabricated domain knowledge. Instead it outputs `anonymous_cluster_N`
+labels and directs the analyst to cross-reference the feature index mapping with the
+original data provider.
+
+---
+
 ## Limitations to acknowledge proactively
 
 1. All results are on simulated or public dataset data — not validated in a real fab environment.

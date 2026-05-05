@@ -151,25 +151,85 @@ binary pass/fail labels).
 
 ### Approach
 
-**SPC Layer:**
-- X-bar chart, R chart, EWMA chart
-- All 8 Western Electric Rules implemented and unit-tested
-- Per-parameter violation event log with rule ID and description
+| Component | Implementation | Rationale |
+|-----------|---------------|-----------|
+| SPC | 4 Western Electric Rules (Rules 1–4) | Interpretable, per-parameter, ISO 7870 compliant |
+| Anomaly detection | Isolation Forest (sklearn) | Multivariate, unsupervised, fast inference |
+| Anomaly detection | Autoencoder (PyTorch MLP) | Reconstruction-error-based; catches correlated shifts |
+| Ensemble | `any` / `all` voting | Tune recall vs precision trade-off for false-alarm cost |
 
-**ML Anomaly Detection:**
-- Isolation Forest (scikit-learn): multivariate, unsupervised, fast inference
-- Autoencoder (PyTorch MLP): reconstruction-error-based detection; threshold at 95th percentile
-  of training reconstruction error
-- Ensemble: configurable `any` / `majority` / `all` strategy
+### SPC vs ML: Complementary Layers
 
-**Evaluation** (on simulated data with ground-truth anomaly labels):
+| Aspect | SPC (WE Rules) | ML (IF + Autoencoder) |
+|--------|---------------|----------------------|
+| Interpretability | High — exact rule and sigma zone named | Low-medium — anomaly score only |
+| Scope | Univariate, one parameter at a time | Multivariate, all features jointly |
+| Training data needed | No — statistical formulas | Yes — requires process-baseline data |
+| Detects subtle correlated shifts | No | Yes |
+| Regulatory / audit trail | Yes (ISO 7870, SEMI E10) | Requires additional documentation |
 
-| Model | Precision | Recall | F1 | False Alarm Rate |
-|-------|-----------|--------|----|-----------------|
-| SPC (WE Rules) | TBD | TBD | TBD | TBD |
-| Isolation Forest | TBD | TBD | TBD | TBD |
-| Autoencoder | TBD | TBD | TBD | TBD |
-| Ensemble | TBD | TBD | TBD | TBD |
+In practice, SPC and ML run in parallel: SPC for univariate rule-based alerts and regulatory
+compliance; ML for multivariate anomaly patterns that no single parameter's chart would catch.
+A violation from either layer triggers engineer investigation — neither is a confirmed defect.
+
+### Feature Sets and Leakage Boundaries
+
+Two named feature sets are defined to make the model's information horizon explicit and prevent
+temporal leakage:
+
+| Feature set | CLI flag | Features | When available |
+|-------------|----------|----------|----------------|
+| `process_only` | `--feature-set process_only` | temperature, pressure, gas\_flow, rf\_power, exposure\_dose | During step execution (in-situ, real-time) |
+| `full` | `--feature-set full` (default) | all 8 features — adds film\_thickness, overlay\_error, defect\_density | After offline inspection (post-process only) |
+
+**`process_only`** avoids label, outcome, and metrology leakage entirely. All five features
+are reported by the process tool in real time during step execution — no post-process
+inspection result is included. This is the correct set for early detection: flagging issues
+while the lot is still on the tool, before any offline measurement is scheduled.
+
+**`full`** adds the three offline inspection results (film thickness from ellipsometer,
+overlay error from metrology tool, defect density from wafer inspection scanner). These are
+only available after the process step completes and the wafer is routed to an inspection
+station. Use this set exclusively for post-process quality monitoring or retrospective
+anomaly analysis — **not** for real-time or inline detection models.
+
+`yield_rate`, `anomaly_label`, `anomaly_type`, and `suspected_root_cause` are **never** used
+as model inputs. The ground-truth labels in the synthetic dataset are generated from
+controlled perturbations (e.g., step-specific temperature drift, pressure spikes) and are
+used **only** to evaluate detection recall on the held-out test split — training is fully
+unsupervised.
+
+### Train / Validation / Test Split
+
+The dataset is partitioned by `lot_id` before any model fitting, so all wafers from a given
+lot stay in the same split. No wafer from a training lot appears in the test evaluation.
+
+| Split | Lots | Rows | Purpose |
+|-------|------|------|---------|
+| Train | 35 (70%) | 4,375 | Unsupervised detector fitting |
+| Val | 7 (14%) | 875 | Available for threshold tuning (not used in current pipeline) |
+| Test | 8 (16%) | 1,000 | Held out; all reported metrics are on this split only |
+
+The split is deterministic (seed = 42). Split metadata (which `lot_id`s belong to each split)
+is saved to `outputs/models/split_info.json` alongside trained models. The evaluate script
+reads this file to reconstruct the identical test set — it never touches training lots.
+
+### Results (simulated data — held-out test split, not real fab performance)
+
+> All metrics are on the held-out **test split** (8 lots, 1,000 rows, anomaly rate ≈ 21.8%).
+> Detectors were trained only on the 35-lot training split; test lots were never seen during fitting.
+> These numbers validate pipeline correctness, not real-world detection capability.
+
+| Model | Precision | Recall | F1 | False Alarm Rate | ROC-AUC |
+|-------|-----------|--------|----|-----------------|---------|
+| Isolation Forest | 0.56 | 0.15 | 0.24 | 0.033 | 0.74 |
+| Autoencoder | 0.42 | 0.17 | 0.24 | 0.063 | 0.65 |
+| Ensemble (any) | 0.46 | 0.24 | 0.32 | 0.081 | 0.74 |
+| Ensemble (all) | 0.57 | 0.07 | 0.13 | 0.015 | 0.74 |
+
+The moderate recall reflects that the synthetic anomalies include subtle slow drifts (last 20%
+of lots, +6 °C temperature) which both models partially miss — a realistic challenge in fabs.
+Full evaluation report: `outputs/reports/process/anomaly_summary.json`.
 
 ### Real-World Considerations
 
@@ -264,7 +324,28 @@ python scripts/train_module_a.py --config configs/module_a.yaml
 make train-wafer
 ```
 
-### 7. Run Module B pipeline
+### 7. Run Module B — SPC analysis
+
+```bash
+python scripts/run_spc_analysis.py
+```
+
+Outputs: `outputs/reports/process/spc_violations.csv` + 26 control chart PNGs.
+
+### 8. Run Module B — ML anomaly detection
+
+```bash
+# Train Isolation Forest + Autoencoder (unsupervised, no labels used)
+python scripts/train_process_anomaly.py
+
+# Evaluate against ground-truth labels and save reports
+python scripts/evaluate_process_anomaly.py
+```
+
+Outputs: `outputs/reports/process/anomaly_scores.csv`, `anomaly_summary.json`,
+`feature_importance.csv`.
+
+### 9. Run Module B full pipeline (legacy)
 
 ```bash
 python scripts/run_module_b_pipeline.py --stage full
