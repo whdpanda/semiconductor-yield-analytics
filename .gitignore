@@ -44,16 +44,33 @@ ENV/
 env.bak/
 venv.bak/
 
-# Raw data — never commit large binary datasets
+# ── Data directories ──────────────────────────────────────────────────────────
+# Never commit raw datasets, processed artifacts, or train/val/test splits
 data/raw/
 data/processed/
+data/splits/
 
-# Outputs — model weights and reports are large; use DVC or HuggingFace Hub
-outputs/models/
-outputs/logs/
+# Synthetic data is small and reproducible — kept untracked (regenerate on demand)
+data/synthetic/
 
-# Synthetic data is small and CAN be committed — remove this line if desired
-# data/synthetic/
+# ── Generated outputs ──────────────────────────────────────────────────────────
+# All of outputs/ is generated at runtime — reports, charts, model weights, logs
+/outputs/
+/reports/
+
+# Top-level model/checkpoint dirs (in case someone saves outside outputs/)
+/models/
+/checkpoints/
+
+# ── Binary / large artifact file types ────────────────────────────────────────
+*.pkl
+*.zip
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints

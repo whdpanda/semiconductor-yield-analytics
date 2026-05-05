@@ -22,10 +22,39 @@ Three reasons:
 
 ---
 
-## What is Western Electric Rules and why does it matter?
+## What is SPC and why is it essential in semiconductor manufacturing?
+
+Statistical Process Control (SPC) is a real-time monitoring methodology that applies statistical
+methods to process data to detect when a process has changed — before defective product is made.
+In semiconductor fabs, hundreds of parameters (temperature, pressure, gas flow, etch rate, …) are
+measured for every wafer. SPC provides the first line of defense.
+
+Why it is mandatory in fabs:
+- SEMI standards (E10, E116) and ISO 7870 require statistical process monitoring at all critical steps.
+- Detecting an excursion one lot early can save 25 wafers × up to ~$10k/wafer at advanced nodes.
+- The spatial pattern of a violation (gradual drift vs. sudden shift vs. spike) guides root-cause
+  analysis toward the right equipment or consumable — before running a full DOE.
+
+SPC output is an *anomaly signal*, not a confirmed root cause. A violation flags that something
+changed statistically; determining what and why requires engineer investigation.
+
+---
+
+## Western Electric Rules: what they are and why they matter
 
 WE Rules are a set of 8 statistical tests defined in the Western Electric Handbook (1956) and
-adopted by SEMI/ISO standards for semiconductor SPC. Every process engineer in a fab knows them.
+adopted by SEMI/ISO standards. Every process engineer in a fab knows them. This project
+implements 4 of the most widely used rules:
+
+| Rule | Pattern detected | Severity | What it may suggest |
+|------|-----------------|----------|---------------------|
+| Rule 1 | 1 point beyond 3σ | HIGH | Sudden large excursion — equipment fault, contamination, measurement error |
+| Rule 2 | 2 of 3 consecutive beyond 2σ, same side | MEDIUM | Process operating near limit — gradual parameter shift |
+| Rule 3 | 4 of 5 consecutive beyond 1σ, same side | LOW | Sustained bias — consumable wear, recipe drift |
+| Rule 4 | 8 consecutive on same side of centerline | LOW | Process mean has shifted — recalibration or component swap |
+
+Severity reflects urgency of engineer response, not certainty that a defect has occurred.
+
 Showing that I can implement and explain WE Rules demonstrates domain familiarity beyond just
 knowing scikit-learn.
 
@@ -82,6 +111,32 @@ A false alarm in fab means:
 So high precision is often more important than high recall in production SPC.
 The ensemble strategy and threshold tuning in this project can be configured to prioritize
 precision ("all" strategy) or recall ("any" strategy).
+
+---
+
+## How this project avoids treating ML as a black box
+
+Several design choices make model behavior interpretable and auditable:
+
+1. **SPC layer runs independently first.** Rule-based violations are computed without any neural
+   network. An engineer can read the violation table, understand the exact rule that triggered,
+   and act — without ever touching a model.
+
+2. **Violations carry rule ID + description + severity**, not just a score. "Rule 1 — HIGH" tells
+   the engineer "one measurement exceeded 3σ" — a concrete, actionable statement.
+
+3. **Grad-CAM for wafer maps.** CNN predictions are accompanied by gradient-weighted activation
+   maps that highlight which region of the wafer drove the classification. Engineers can compare
+   the heatmap with known defect shapes (ring, scratch, center spot) and validate or override.
+
+4. **Ensemble transparency.** The Module B ensemble reports *which sub-model* (SPC, Isolation
+   Forest, Autoencoder) flagged each sample. "SPC flagged, Isolation Forest did not" provides
+   a richer signal than a single binary prediction.
+
+5. **Ground-truth labels in simulated data.** The synthetic dataset includes `anomaly_type` and
+   `suspected_root_cause` columns, enabling per-type precision/recall evaluation. This makes it
+   possible to say "SPC catches 95% of step-shifts but misses 40% of slow drifts" — an honest,
+   specific claim rather than an opaque accuracy number.
 
 ---
 
