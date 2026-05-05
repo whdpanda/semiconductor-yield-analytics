@@ -59,12 +59,12 @@ An automated classifier accelerates root-cause analysis and enables real-time yi
 
 | Component | Choice | Rationale |
 |-----------|--------|-----------|
-| Architecture | ResNet-18 (pretrained, fine-tuned) | Proven baseline; fits on a single GPU |
-| Loss function | Focal Loss | Penalizes easy majority-class samples, improves minority-class recall |
-| Sampling | `WeightedRandomSampler` | Balances class frequency within each batch |
-| Augmentation | Random 90° rotation, horizontal/vertical flip | Exploits wafer rotational symmetry |
+| Architecture | WaferCNN (3 conv blocks + GAP, ~94K params) | Lightweight baseline; runs on CPU; no pretrained weights needed |
+| Loss function | CrossEntropyLoss | Standard multi-class loss; class imbalance handled by sampler |
+| Sampling | `WeightedRandomSampler` | Equalises class frequency per batch; preferred over loss-weighting at extreme imbalance |
+| Augmentation | Random 90° rotation, horizontal/vertical flip | Exploits wafer rotational symmetry; preserves discrete {0,1,2} values |
 | Primary metric | Macro F1 | Equal weight across all 9 classes; accuracy is misleading at 79% imbalance |
-| Explainability | Grad-CAM | Visualizes which wafer regions drove the prediction |
+| LR schedule | CosineAnnealingLR | Smooth decay without manual step tuning |
 
 ### Data Preparation
 
@@ -114,14 +114,42 @@ python scripts/run_wafer_eda.py --max-samples 5000
 Macro F1 is used as the primary training metric because accuracy would be 79%
 even for a degenerate "predict none" classifier.
 
+### Training and Evaluation
+
+**Train (requires `data/raw/wm811k/LSWMD.pkl`):**
+
+```bash
+# Default: 30 epochs, batch 64, Adam lr=1e-3, WeightedRandomSampler enabled
+python scripts/train_wafer_cnn.py
+
+# Faster smoke run (subsamples 5 000 labeled wafers)
+python scripts/train_wafer_cnn.py --max-samples 5000 --epochs 5
+
+# Longer run
+python scripts/train_wafer_cnn.py --epochs 50 --batch-size 128
+```
+
+Outputs: `outputs/models/wafer_cnn_best.pth`, `outputs/reports/wafer/training_metrics.json`,
+`outputs/reports/wafer/confusion_matrix_val.png`.
+
+**Evaluate on held-out test split:**
+
+```bash
+python scripts/evaluate_wafer_cnn.py
+```
+
+Outputs: `outputs/reports/wafer/evaluation_metrics.json`, `confusion_matrix_test.png`,
+`misclassified.png`.
+
 ### Results
 
-> CNN training not yet started — results will be updated after Phase 5 completion.
+> Metrics on **WM-811K public dataset** only.
+> This is a portfolio project — numbers reflect dataset properties, not real fab deployment performance.
 
 | Split | Macro F1 | Notes |
 |-------|----------|-------|
-| Validation | TBD | |
-| Test | TBD | |
+| Validation | TBD | Run `train_wafer_cnn.py` to populate |
+| Test | TBD | Run `evaluate_wafer_cnn.py` to populate |
 
 ---
 
@@ -319,9 +347,17 @@ make test
 ### 6. Train Module A (wafer map classifier)
 
 ```bash
-python scripts/train_module_a.py --config configs/module_a.yaml
-# or
-make train-wafer
+# Requires data/raw/wm811k/LSWMD.pkl — see step 3 above
+python scripts/train_wafer_cnn.py
+
+# Quick smoke run (5 000 samples, 5 epochs)
+python scripts/train_wafer_cnn.py --max-samples 5000 --epochs 5
+```
+
+### 6b. Evaluate Module A (test split)
+
+```bash
+python scripts/evaluate_wafer_cnn.py
 ```
 
 ### 7. Run Module B — SPC analysis
