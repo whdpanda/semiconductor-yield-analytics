@@ -424,13 +424,38 @@ python scripts/run_module_b_pipeline.py --stage full
 make run-spc
 ```
 
-### 8. Launch dashboard
+### 10. Launch the unified dashboard
 
 ```bash
-streamlit run app/main.py
-# or
-make dashboard
+# Recommended — launches the full unified dashboard
+streamlit run src/semiconductor_yield/dashboard/app.py
+# -- or --
+python scripts/run_dashboard.py
+
+# Standalone wafer map demo only (no process data required)
+streamlit run src/semiconductor_yield/dashboard/wafer_demo.py
+python scripts/run_wafer_demo.py
 ```
+
+The dashboard auto-detects available data and falls back to demo mode gracefully:
+
+| Page | Requires | Falls back to |
+|------|----------|---------------|
+| Wafer Map Classification | `outputs/models/wafer_cnn_best.pth` | Random-weight demo mode |
+| Process SPC | `outputs/reports/process/spc_violations.csv` | Warning + run command |
+| Anomaly Detection | `outputs/reports/process/anomaly_scores.csv` | Warning + run command |
+| RCA Analysis | `data/synthetic/process_data.csv` | Warning + run command |
+
+**Interview demo sequence (recommended):**
+1. **Home** — data context and disclaimer
+2. **Wafer Map Classification** — generate Center or Edge-Ring demo sample, observe prediction
+3. **Process SPC** — select `Etching | temperature`, inspect control chart and violation table
+4. **Anomaly Detection** — score trend, per-step anomaly rate, flagged sample table
+5. **RCA Analysis** — top candidate with evidence bullets and recommended checks
+6. **Real Fab Considerations** — proactively surface deployment gaps (shows manufacturing awareness)
+
+> **Screenshot placeholder:** `docs/assets/dashboard_screenshot.png`
+> *(run the dashboard and add a screenshot here)*
 
 ---
 
