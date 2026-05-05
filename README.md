@@ -141,6 +141,31 @@ python scripts/evaluate_wafer_cnn.py
 Outputs: `outputs/reports/wafer/evaluation_metrics.json`, `confusion_matrix_test.png`,
 `misclassified.png`.
 
+### Interactive Demo
+
+A Streamlit web demo lets you visualise each defect class and run
+inference without WM-811K data (uses synthetic patterns when no
+checkpoint is available).
+
+```bash
+# Launch the demo
+streamlit run src/semiconductor_yield/dashboard/wafer_demo.py
+# -- or --
+python scripts/run_wafer_demo.py
+```
+
+The demo will:
+- Auto-detect whether a trained checkpoint exists
+  (`outputs/models/wafer_cnn_best.pth`)
+- Fall back to **demo mode** (randomly-initialised weights, clearly
+  labelled) if the checkpoint is missing — so the UI can be shown
+  without training first
+- Accept uploaded `.npy`, `.pkl`, or `.csv` wafer map files alongside
+  the built-in synthetic pattern generator
+
+> **Screenshot:** `docs/assets/wafer_demo_screenshot.png`
+> *(placeholder — run the demo and add a screenshot here)*
+
 ### Results
 
 > Metrics on **WM-811K public dataset** only.
@@ -150,6 +175,16 @@ Outputs: `outputs/reports/wafer/evaluation_metrics.json`, `confusion_matrix_test
 |-------|----------|-------|
 | Validation | TBD | Run `train_wafer_cnn.py` to populate |
 | Test | TBD | Run `evaluate_wafer_cnn.py` to populate |
+
+### Interview talking points
+
+| Topic | What to say |
+|-------|-------------|
+| **Why ~94K params, not ResNet?** | Lightweight baseline that runs on CPU with no pretrained weights. The goal is demonstrating the full pipeline (data → train → eval → demo), not achieving SOTA. |
+| **Why WeightedRandomSampler over focal loss?** | At 79% imbalance, the sampler re-balances the gradient signal itself rather than just scaling the loss — empirically more stable for extreme imbalance. |
+| **Why macro F1, not accuracy?** | A "predict none" classifier achieves 79% accuracy. Macro F1 gives equal weight to all 9 classes. |
+| **What's missing for real fab?** | Recipe drift detection, per-tool normalisation, domain shift monitoring, regulatory audit trail, false-alarm cost modelling. Documented in `docs/interview_notes.md`. |
+| **What does demo mode mean?** | If no checkpoint is present, the UI runs with random weights and clearly labels predictions as meaningless — so the layout and interaction can be demonstrated without needing to train first. |
 
 ---
 

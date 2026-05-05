@@ -210,3 +210,54 @@ original data provider.
 3. SECOM has only 1,567 samples — too few for robust deep learning; used for pipeline demo only.
 4. The Autoencoder threshold is set on training data — in production, this would need
    continuous recalibration as the process evolves.
+
+---
+
+## Module A Inference & Streamlit Demo
+
+### Architecture choices for the CNN baseline
+
+The project uses a custom lightweight WaferCNN (~94K parameters) rather than a pretrained ResNet:
+
+- **Why not ResNet-18?** Pretrained ImageNet weights are not appropriate for single-channel
+  wafer maps (the input domain is completely different from natural images). Fine-tuning adds
+  complexity without clear benefit at 64x64 resolution.
+- **Why Global Average Pooling (GAP) instead of fully-connected?** GAP reduces parameters from
+  ~8M (FC) to ~1K and retains spatial awareness — beneficial when the defect class is spatially
+  defined (e.g., Edge-Ring occupies the outer ring of the map).
+- **Why WeightedRandomSampler over focal loss?** At 79% imbalance, the sampler re-balances
+  the gradient signal by construction, rather than just re-weighting the loss magnitude.
+  Both approaches work; WeightedRandomSampler is simpler to reason about.
+
+### Demo mode design rationale
+
+The Streamlit demo has two operating modes:
+
+1. **Trained mode** — checkpoint `outputs/models/wafer_cnn_best.pth` exists; real softmax
+   probabilities displayed.
+2. **Demo mode** — no checkpoint found; a randomly-initialised WaferCNN is used.
+   `InferenceResult.is_demo = True` is surfaced in the UI with a clear warning.
+
+Why support demo mode at all? During interviews or code reviews, showing the full UI
+interaction (upload, visualise, predict) is valuable even before training has completed.
+The key invariant: demo-mode predictions are labelled "MEANINGLESS" and can never be
+confused with real model output by anyone reading the UI.
+
+### What a real fab inference pipeline would add
+
+| Gap | Description |
+|-----|-------------|
+| **Lot-level grouping** | Inference should group results by lot and flag lots, not individual wafers |
+| **Threshold calibration** | Confidence threshold for "requires review" needs fab-specific tuning |
+| **Model versioning** | Each checkpoint must be tied to a training data snapshot and recipe version |
+| **Drift monitoring** | If the softmax confidence distribution shifts, the model may be out of distribution |
+| **Explainability** | Grad-CAM heatmaps show which wafer region drove the prediction — essential for engineer trust |
+| **Integration** | Real deployment connects to MES/FMEA to automatically open investigation tickets |
+
+### Synthetic patterns for demo
+
+The `demo_samples.py` module generates wafer maps that *visually resemble* WM-811K patterns
+using simple geometry (circles, rings, diagonal lines). They are:
+- Clearly labelled SYNTHETIC in the UI
+- Used only for interactive demonstration — never as training or evaluation data
+- Reproducible via seed for consistent screenshots
