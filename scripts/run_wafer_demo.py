@@ -24,7 +24,11 @@ def main() -> int:
 
     cmd = [sys.executable, "-m", "streamlit", "run", str(_DEMO_PAGE)]
     print(f"Starting: {' '.join(cmd)}")
-    return subprocess.call(cmd)
+    try:
+        return subprocess.call(cmd)
+    except KeyboardInterrupt:
+        print("\nWafer demo stopped.")
+        return 0
 
 
 if __name__ == "__main__":

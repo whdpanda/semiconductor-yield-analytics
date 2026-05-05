@@ -23,7 +23,11 @@ def main() -> int:
         return 1
     cmd = [sys.executable, "-m", "streamlit", "run", str(_APP)]
     print(f"Starting: {' '.join(cmd)}")
-    return subprocess.call(cmd)
+    try:
+        return subprocess.call(cmd)
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
+        return 0
 
 
 if __name__ == "__main__":
