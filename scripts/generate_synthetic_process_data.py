@@ -73,7 +73,7 @@ def main() -> None:
         anomaly_types=args.anomaly_types,
     )
 
-    df.to_csv(out_path, index=False)
+    df.to_csv(out_path, index=False, encoding="utf-8")
 
     # ── Summary ────────────────────────────────────────────────────────────────
     n_anomalies = int(df["anomaly_label"].sum())

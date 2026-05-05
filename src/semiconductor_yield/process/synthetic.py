@@ -79,10 +79,10 @@ STEP_NOMINALS: dict[str, dict[str, tuple[float, float]]] = {
 
 ROOT_CAUSE_DESCRIPTIONS: dict[str, str] = {
     "normal":      "No anomaly detected",
-    "drift":       "Gradual parameter drift — possible consumable wear or supply variation",
-    "spike":       "Transient excursion — possible equipment event or measurement outlier",
-    "step_shift":  "Sudden level shift — possible calibration event or component replacement",
-    "tool_offset": "Systematic tool-to-tool offset — chamber matching recommended",
+    "drift":       "Gradual parameter drift - possible consumable wear or supply variation",
+    "spike":       "Transient excursion - possible equipment event or measurement outlier",
+    "step_shift":  "Sudden level shift - possible calibration event or component replacement",
+    "tool_offset": "Systematic tool-to-tool offset - chamber matching recommended",
 }
 
 PARAM_COLS: list[str] = [
@@ -102,7 +102,7 @@ class SyntheticProcessDataGenerator:
     Example:
         gen = SyntheticProcessDataGenerator(seed=42)
         df = gen.generate(n_lots=50, n_wafers_per_lot=25)
-        df.to_csv("data/synthetic/process_data.csv", index=False)
+        df.to_csv("data/synthetic/process_data.csv", index=False, encoding="utf-8")
     """
 
     def __init__(self, seed: int = RANDOM_SEED) -> None:
