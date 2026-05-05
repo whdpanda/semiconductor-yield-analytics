@@ -9,7 +9,9 @@ Download instructions: see docs/data_contract.md or README.md.
 
 from __future__ import annotations
 
+import importlib
 import pickle
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -38,6 +40,57 @@ class WaferSample:
     lot_name: str
     wafer_index: int
     split: str              # "train" or "test" per the original dataset split field
+
+
+# ── Legacy pickle compatibility ────────────────────────────────────────────────
+
+def _install_legacy_pandas_pickle_aliases() -> None:
+    """Register old pandas.indexes.* module paths that no longer exist.
+
+    LSWMD.pkl was serialised with an old pandas version that stored objects
+    under 'pandas.indexes.*'. Modern pandas moved everything to
+    'pandas.core.indexes.*'. Registering aliases in sys.modules lets the
+    unpickler resolve the old paths without requiring a pandas downgrade.
+    """
+    import pandas.core.indexes as _core_indexes
+
+    sys.modules.setdefault("pandas.indexes", _core_indexes)
+
+    for _name in (
+        "base", "range", "multi", "datetimes",
+        "timedeltas", "period", "category", "interval",
+    ):
+        try:
+            _mod = importlib.import_module(f"pandas.core.indexes.{_name}")
+            sys.modules.setdefault(f"pandas.indexes.{_name}", _mod)
+        except ModuleNotFoundError:
+            pass
+
+
+def _load_legacy_pickle(path: Path) -> pd.DataFrame:
+    """Load a potentially legacy-pandas pickle, with automatic compatibility fallback.
+
+    Strategy:
+        1. Try pd.read_pickle(path)  — works for most modern pickles.
+        2. If that raises ModuleNotFoundError (old 'pandas.indexes' paths) or
+           UnicodeDecodeError (Python-2-era pickle with non-ASCII bytes), install
+           legacy module aliases and retry with pickle.load(..., encoding='latin1').
+           Both errors indicate LSWMD.pkl was serialised with an old pandas/Python 2.
+    """
+    try:
+        return pd.read_pickle(path)
+    except (ModuleNotFoundError, UnicodeDecodeError) as exc:
+        if isinstance(exc, ModuleNotFoundError) and exc.name != "pandas.indexes":
+            raise
+
+        logger.warning(
+            f"pd.read_pickle failed for legacy WM-811K pickle ({type(exc).__name__}); "
+            "retrying with latin1 compatibility fallback."
+        )
+        _install_legacy_pandas_pickle_aliases()
+
+        with open(path, "rb") as fh:
+            return pickle.load(fh, encoding="latin1")
 
 
 # ── Parsing helpers ────────────────────────────────────────────────────────────
@@ -114,8 +167,7 @@ class WM811KLoader:
         """Return the raw DataFrame from LSWMD.pkl without any filtering or resizing."""
         self._assert_file_exists()
         logger.info(f"Loading WM-811K from {self.pkl_path} ...")
-        with open(self.pkl_path, "rb") as fh:
-            df = pickle.load(fh)
+        df = _load_legacy_pickle(self.pkl_path)
         if not isinstance(df, pd.DataFrame):
             raise TypeError(
                 f"Expected a pandas DataFrame from {self.pkl_path}, "

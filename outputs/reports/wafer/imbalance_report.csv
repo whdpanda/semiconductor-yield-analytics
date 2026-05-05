@@ -1,0 +1,10 @@
+class_name,count,percentage,imbalance_ratio,weight
+none,4825,96.5,1.0,0.1151
+Edge-Loc,76,1.52,63.49,7.3099
+Loc,39,0.78,123.72,14.245
+Random,19,0.38,253.95,29.2398
+Scratch,17,0.34,283.82,32.6797
+Center,10,0.2,482.5,55.5556
+Edge-Ring,7,0.14,689.29,79.3651
+Near-full,7,0.14,689.29,79.3651
+Donut,0,0.0,inf,

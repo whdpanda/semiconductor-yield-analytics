@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/c/Users/wangh/projects/**)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -v)"
+    ]
+  }
+}

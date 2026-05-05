@@ -66,9 +66,57 @@ An automated classifier accelerates root-cause analysis and enables real-time yi
 | Primary metric | Macro F1 | Equal weight across all 9 classes; accuracy is misleading at 79% imbalance |
 | Explainability | Grad-CAM | Visualizes which wafer regions drove the prediction |
 
+### Data Preparation
+
+**Step 1 — Download WM-811K**
+
+The dataset is not bundled with this repository. Download manually from Kaggle:
+
+```
+https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map
+```
+
+Place the file at `data/raw/wm811k/LSWMD.pkl` (~350 MB). If the file is missing,
+all Module A scripts will print a clear download instruction and exit.
+
+**Step 2 — Run EDA**
+
+```bash
+python scripts/run_wafer_eda.py
+```
+
+Outputs saved to `outputs/reports/wafer/`:
+
+| File | Description |
+|------|-------------|
+| `class_distribution.csv` | Count and percentage per defect class |
+| `class_distribution.png` | Horizontal bar chart (labeled wafers only) |
+| `imbalance_report.csv` | Per-class count, imbalance ratio, and balanced weight |
+| `sample_wafer_maps.png` | 9 × 3 grid of example wafer maps per class |
+| `wafer_map_sizes.csv` | Distribution of raw wafer map dimensions |
+
+For a fast smoke run without loading all 172k samples:
+
+```bash
+python scripts/run_wafer_eda.py --max-samples 5000
+```
+
+**Class imbalance (labeled subset ~172k wafers)**
+
+| Class | Count | % |
+|-------|-------|---|
+| none | ~147k | 79% |
+| Edge-Ring | ~9.7k | 5.2% |
+| Edge-Loc | ~5.2k | 2.8% |
+| … | … | … |
+| Near-Full | ~149 | 0.08% |
+
+Macro F1 is used as the primary training metric because accuracy would be 79%
+even for a degenerate "predict none" classifier.
+
 ### Results
 
-> Training in progress — results will be updated after Phase 5 completion.
+> CNN training not yet started — results will be updated after Phase 5 completion.
 
 | Split | Macro F1 | Notes |
 |-------|----------|-------|
@@ -187,7 +235,20 @@ python scripts/generate_synthetic_data.py
 make generate-data
 ```
 
-### 4. Run tests
+### 4. Run EDA (Module A)
+
+```bash
+# Full EDA — requires data/raw/wm811k/LSWMD.pkl
+python scripts/run_wafer_eda.py
+
+# Fast smoke run (5 000 samples)
+python scripts/run_wafer_eda.py --max-samples 5000
+```
+
+Outputs land in `outputs/reports/wafer/`. If the pkl file is missing, the script
+prints clear download instructions and exits — no cryptic traceback.
+
+### 5. Run tests
 
 ```bash
 pytest tests/
@@ -195,7 +256,7 @@ pytest tests/
 make test
 ```
 
-### 5. Train Module A (wafer map classifier)
+### 6. Train Module A (wafer map classifier)
 
 ```bash
 python scripts/train_module_a.py --config configs/module_a.yaml
@@ -203,7 +264,7 @@ python scripts/train_module_a.py --config configs/module_a.yaml
 make train-wafer
 ```
 
-### 6. Run Module B pipeline
+### 7. Run Module B pipeline
 
 ```bash
 python scripts/run_module_b_pipeline.py --stage full
@@ -211,7 +272,7 @@ python scripts/run_module_b_pipeline.py --stage full
 make run-spc
 ```
 
-### 7. Launch dashboard
+### 8. Launch dashboard
 
 ```bash
 streamlit run app/main.py

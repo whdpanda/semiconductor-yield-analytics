@@ -59,8 +59,8 @@ def test_label_to_idx_has_9_classes():
 
 
 def test_label_to_idx_contains_expected_classes():
-    expected = {"Center", "Donut", "Edge-Loc", "Edge-Ring", "Local",
-                "Near-Full", "Random", "Scratch", "none"}
+    expected = {"Center", "Donut", "Edge-Loc", "Edge-Ring", "Loc",
+                "Near-full", "Random", "Scratch", "none"}
     assert set(LABEL_TO_IDX.keys()) == expected
 
 

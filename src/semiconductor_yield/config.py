@@ -27,6 +27,7 @@ OUTPUTS_DIR = ROOT_DIR / "outputs"
 MODELS_DIR = OUTPUTS_DIR / "models"
 REPORTS_DIR = OUTPUTS_DIR / "reports"
 GRADCAM_DIR = REPORTS_DIR / "gradcam"
+WAFER_REPORTS_DIR = REPORTS_DIR / "wafer"
 LOGS_DIR = OUTPUTS_DIR / "logs"
 
 # ── Config directory ───────────────────────────────────────────────────────────
@@ -44,8 +45,8 @@ WAFER_DEFECT_CLASSES = [
     "Donut",
     "Edge-Loc",
     "Edge-Ring",
-    "Local",
-    "Near-Full",
+    "Loc",
+    "Near-full",
     "Random",
     "Scratch",
     "none",
@@ -55,5 +56,5 @@ NUM_WAFER_CLASSES = len(WAFER_DEFECT_CLASSES)
 
 def ensure_output_dirs() -> None:
     """Create all output directories if they don't exist."""
-    for d in [MODELS_DIR, REPORTS_DIR, GRADCAM_DIR, LOGS_DIR, WAFER_MAPS_DIR, SPC_PROCESSED_DIR]:
+    for d in [MODELS_DIR, REPORTS_DIR, GRADCAM_DIR, WAFER_REPORTS_DIR, LOGS_DIR, WAFER_MAPS_DIR, SPC_PROCESSED_DIR]:
         d.mkdir(parents=True, exist_ok=True)
