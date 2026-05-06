@@ -2,6 +2,9 @@
 
 Public API:
   evaluate_model(model, loader, device, class_names)          -> EvalResult
+  collect_probabilities(model, loader, device)                -> (probs, y_true)
+  apply_none_bias_threshold(probs, none_idx, threshold)       -> y_pred
+  save_calibration_report(probs_cal, y_cal, probs_eval, y_eval, class_names, output_dir) -> dict
   plot_confusion_matrix(cm, class_names, output_path)
   plot_confusion_matrix_normalized(cm, class_names, output_path)
   save_classification_report(result, output_dir)
@@ -24,6 +27,8 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    precision_score,
+    recall_score,
 )
 
 from semiconductor_yield.models.wafer_cnn import WaferCNN
@@ -123,6 +128,367 @@ def evaluate_model(
         confusion_matrix=cm,
         class_names=class_names,
     )
+
+
+# ── Probability collection ────────────────────────────────────────────────────
+
+def collect_probabilities(
+    model: WaferCNN,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run inference on loader and return softmax probabilities and true labels.
+
+    Args:
+        model: Trained WaferCNN in eval mode.
+        loader: DataLoader over the split.
+        device: Torch device.
+
+    Returns:
+        Tuple of:
+          - probs: shape (N, n_classes), softmax probabilities.
+          - y_true: shape (N,), integer class labels.
+    """
+    model.eval()
+    all_probs: list[np.ndarray] = []
+    all_labels: list[int] = []
+
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            probs = torch.softmax(model(x), dim=1).cpu().numpy()
+            all_probs.append(probs)
+            all_labels.extend(y.numpy().tolist())
+
+    return np.vstack(all_probs), np.array(all_labels)
+
+
+# ── Threshold calibration ──────────────────────────────────────────────────────
+
+def apply_none_bias_threshold(
+    probs: np.ndarray,
+    none_idx: int,
+    threshold: float,
+) -> np.ndarray:
+    """Apply a confidence threshold to suppress low-confidence defect predictions.
+
+    For each sample, if the best non-none class probability is below
+    ``threshold``, the prediction is overridden to the none class.  At
+    ``threshold=0.0`` the result is identical to argmax (no change).
+
+    This reduces false alarms (true-none samples predicted as defect) at the
+    cost of lower defect recall.
+
+    Args:
+        probs: (N, n_classes) softmax probability array.
+        none_idx: Index of the "none" (normal wafer) class.
+        threshold: Minimum confidence required to predict any defect class.
+
+    Returns:
+        Integer prediction array of shape (N,).
+    """
+    n_classes = probs.shape[1]
+    defect_cols = [i for i in range(n_classes) if i != none_idx]
+    best_defect_prob = probs[:, defect_cols].max(axis=1)
+
+    preds = probs.argmax(axis=1).copy()
+    preds[best_defect_prob < threshold] = none_idx
+    return preds
+
+
+def _calibration_row_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    none_idx: int,
+    scratch_idx: int,
+    class_names: list[str],
+) -> dict:
+    """Compute one row of metrics for calibration_report.csv."""
+    n_classes = len(class_names)
+    acc = float((y_true == y_pred).mean())
+    mac_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    wgt_f1 = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
+
+    report = classification_report(
+        y_true, y_pred,
+        labels=list(range(n_classes)),
+        target_names=class_names,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    none_name    = class_names[none_idx]
+    scratch_name = class_names[scratch_idx]
+    none_recall      = float(report.get(none_name,    {}).get("recall",    0.0))
+    scratch_prec     = float(report.get(scratch_name, {}).get("precision", 0.0))
+    scratch_rec      = float(report.get(scratch_name, {}).get("recall",    0.0))
+
+    true_none_mask   = (y_true == none_idx)
+    n_true_none      = int(true_none_mask.sum())
+    false_alarm_rate = float(((y_pred != none_idx) & true_none_mask).sum()) / max(n_true_none, 1)
+
+    true_defect_mask = (y_true != none_idx)
+    n_true_defect    = int(true_defect_mask.sum())
+    defect_recall    = float(((y_pred != none_idx) & true_defect_mask).sum()) / max(n_true_defect, 1)
+
+    return {
+        "accuracy":          round(acc, 4),
+        "macro_f1":          round(mac_f1, 4),
+        "weighted_f1":       round(wgt_f1, 4),
+        "none_recall":       round(none_recall, 4),
+        "scratch_precision": round(scratch_prec, 4),
+        "scratch_recall":    round(scratch_rec, 4),
+        "false_alarm_rate":  round(false_alarm_rate, 4),
+        "defect_recall":     round(defect_recall, 4),
+    }
+
+
+def compute_fab_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    class_names: list[str],
+    none_idx: int | None = None,
+    scratch_idx: int | None = None,
+) -> dict:
+    """Compute false-alarm-aware evaluation metrics for fab context.
+
+    Returns a dict containing: accuracy, macro_f1, weighted_f1, none_recall,
+    scratch_precision, scratch_recall, false_alarm_rate, defect_recall.
+
+    Definitions:
+      false_alarm_rate = count(true_none AND predicted_defect) / count(true_none)
+      defect_recall    = count(true_defect AND predicted_defect) / count(true_defect)
+
+    Args:
+        y_true: Ground-truth integer labels.
+        y_pred: Predicted integer labels.
+        class_names: Ordered class name list (index = label).
+        none_idx: Index of the none class. Inferred from class_names if None.
+        scratch_idx: Index of the Scratch class. Inferred if None.
+
+    Returns:
+        Dict with 8 metric keys, all rounded to 4 decimal places.
+    """
+    if none_idx is None:
+        none_idx = class_names.index("none") if "none" in class_names else len(class_names) - 1
+    if scratch_idx is None:
+        scratch_idx = (
+            class_names.index("Scratch") if "Scratch" in class_names else 0
+        )
+    return _calibration_row_metrics(y_true, y_pred, none_idx, scratch_idx, class_names)
+
+
+def save_calibration_report(
+    probs_cal: np.ndarray,
+    y_true_cal: np.ndarray,
+    probs_eval: np.ndarray,
+    y_true_eval: np.ndarray,
+    class_names: list[str],
+    output_dir: Path,
+    thresholds: list[float] | None = None,
+    none_idx: int | None = None,
+    scratch_idx: int | None = None,
+) -> dict:
+    """Sweep confidence thresholds and produce a false-alarm-aware calibration report.
+
+    Threshold selection is done on the **calibration (val)** split;
+    the final calibrated artefacts (confusion matrix, classification report)
+    are computed on the **evaluation (test)** split using the recommended threshold.
+
+    Outputs written to output_dir:
+      - calibration_report.csv           (threshold sweep on val)
+      - calibration_summary.json         (baseline vs. calibrated comparison)
+      - confusion_matrix_calibrated.png  (calibrated test predictions)
+      - classification_report_calibrated.csv/.json (calibrated test predictions)
+
+    Args:
+        probs_cal:   (N_val, n_classes) softmax probs — used to pick threshold.
+        y_true_cal:  (N_val,) integer labels for val split.
+        probs_eval:  (N_test, n_classes) softmax probs — used for final reporting.
+        y_true_eval: (N_test,) integer labels for test split.
+        class_names: Class name list, index-aligned.
+        output_dir:  Directory to write all outputs.
+        thresholds:  Thresholds to sweep. Defaults to [0.0, 0.3..0.9].
+        none_idx:    Index of "none" class. Inferred from class_names if None.
+        scratch_idx: Index of "Scratch" class. Inferred if None.
+
+    Returns:
+        Dict with keys: recommended_threshold, baseline_* and calibrated_* metrics.
+    """
+    if thresholds is None:
+        thresholds = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+    if none_idx is None:
+        none_idx = class_names.index("none") if "none" in class_names else len(class_names) - 1
+    if scratch_idx is None:
+        scratch_idx = class_names.index("Scratch") if "Scratch" in class_names else 0
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Sweep thresholds on calibration (val) split ───────────────────────────
+    cal_rows: list[dict] = []
+    for t in thresholds:
+        y_pred_t = apply_none_bias_threshold(probs_cal, none_idx, t)
+        m = _calibration_row_metrics(y_true_cal, y_pred_t, none_idx, scratch_idx, class_names)
+        cal_rows.append({"threshold": t, **m})
+
+    # ── Save calibration_report.csv ───────────────────────────────────────────
+    cal_report_path = output_dir / "calibration_report.csv"
+    fieldnames = ["threshold", "accuracy", "macro_f1", "weighted_f1",
+                  "none_recall", "scratch_precision", "scratch_recall",
+                  "false_alarm_rate", "defect_recall"]
+    with open(cal_report_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(cal_rows)
+    logger.info(f"Calibration report saved → {cal_report_path}")
+
+    # ── Select recommended threshold ──────────────────────────────────────────
+    baseline_row = cal_rows[0]  # threshold=0.0 is identical to argmax
+    baseline_none_recall   = baseline_row["none_recall"]
+    baseline_false_alarm   = baseline_row["false_alarm_rate"]
+    baseline_macro_f1      = baseline_row["macro_f1"]
+
+    # Candidates: improve none_recall, keep macro_f1 and defect_recall reasonable
+    candidates = [
+        r for r in cal_rows
+        if r["threshold"] > 0.0
+        and r["none_recall"]  >= baseline_none_recall + 0.05
+        and r["macro_f1"]     >= baseline_macro_f1 * 0.60
+        and r["defect_recall"] >= 0.20
+    ]
+    if not candidates:
+        # Relax: just require macro_f1 not catastrophic
+        candidates = [
+            r for r in cal_rows
+            if r["threshold"] > 0.0
+            and r["none_recall"] >= baseline_none_recall + 0.05
+            and r["macro_f1"] >= baseline_macro_f1 * 0.50
+        ]
+    if not candidates:
+        # Fallback: pick threshold with highest none_recall improvement
+        candidates = [r for r in cal_rows if r["threshold"] > 0.0]
+
+    # Score: reward none_recall improvement and false alarm reduction equally
+    def _score(r: dict) -> float:
+        nr_gain = r["none_recall"] - baseline_none_recall
+        fa_red  = baseline_false_alarm - r["false_alarm_rate"]
+        return 0.5 * nr_gain + 0.5 * fa_red
+
+    recommended_row = max(candidates, key=_score)
+    recommended_threshold = float(recommended_row["threshold"])
+
+    # ── Apply recommended threshold to evaluation (test) split ────────────────
+    y_pred_cal_recommended = apply_none_bias_threshold(probs_eval, none_idx, recommended_threshold)
+    calibrated_metrics = _calibration_row_metrics(
+        y_true_eval, y_pred_cal_recommended, none_idx, scratch_idx, class_names
+    )
+
+    # Baseline metrics on test split (threshold=0.0 == argmax)
+    y_pred_baseline = apply_none_bias_threshold(probs_eval, none_idx, 0.0)
+    base_test_metrics = _calibration_row_metrics(
+        y_true_eval, y_pred_baseline, none_idx, scratch_idx, class_names
+    )
+
+    # ── Save calibration_summary.json ─────────────────────────────────────────
+    tradeoff_note = (
+        f"Threshold {recommended_threshold} was selected on the validation split. "
+        f"none_recall improved from {base_test_metrics['none_recall']:.4f} to "
+        f"{calibrated_metrics['none_recall']:.4f} on the test split. "
+        f"false_alarm_rate improved from {base_test_metrics['false_alarm_rate']:.4f} to "
+        f"{calibrated_metrics['false_alarm_rate']:.4f}. "
+        f"defect_recall changed from {base_test_metrics['defect_recall']:.4f} to "
+        f"{calibrated_metrics['defect_recall']:.4f}. "
+        "Calibration trades defect recall for higher none recall (fewer false alarms). "
+        "In a real fab context, a false alarm incurs tool downtime cost; "
+        "the recommended threshold reflects that false alarms are expensive."
+    )
+
+    summary = {
+        "disclaimer": (
+            "Threshold calibration on WM-811K public dataset (portfolio project — "
+            "not real fab deployment performance)."
+        ),
+        "calibration_split": "val",
+        "evaluation_split":  "test",
+        "thresholds_swept":  thresholds,
+        "recommended_threshold": recommended_threshold,
+        "false_alarm_rate_definition": (
+            "false_alarm_rate = count(true_none AND predicted_defect) / count(true_none)"
+        ),
+        "baseline_accuracy":          base_test_metrics["accuracy"],
+        "baseline_macro_f1":          base_test_metrics["macro_f1"],
+        "baseline_none_recall":       base_test_metrics["none_recall"],
+        "baseline_false_alarm_rate":  base_test_metrics["false_alarm_rate"],
+        "baseline_scratch_precision": base_test_metrics["scratch_precision"],
+        "baseline_scratch_recall":    base_test_metrics["scratch_recall"],
+        "baseline_defect_recall":     base_test_metrics["defect_recall"],
+        "calibrated_accuracy":          calibrated_metrics["accuracy"],
+        "calibrated_macro_f1":          calibrated_metrics["macro_f1"],
+        "calibrated_none_recall":       calibrated_metrics["none_recall"],
+        "calibrated_false_alarm_rate":  calibrated_metrics["false_alarm_rate"],
+        "calibrated_scratch_precision": calibrated_metrics["scratch_precision"],
+        "calibrated_scratch_recall":    calibrated_metrics["scratch_recall"],
+        "calibrated_defect_recall":     calibrated_metrics["defect_recall"],
+        "tradeoff_note": tradeoff_note,
+    }
+
+    summary_path = output_dir / "calibration_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"Calibration summary saved → {summary_path}")
+
+    # ── Save confusion_matrix_calibrated.png ──────────────────────────────────
+    cm_cal = confusion_matrix(
+        y_true_eval, y_pred_cal_recommended,
+        labels=list(range(len(class_names))),
+    )
+    plot_confusion_matrix_normalized(
+        cm_cal, class_names,
+        output_dir / "confusion_matrix_calibrated.png",
+        title=f"Confusion Matrix Calibrated (threshold={recommended_threshold})",
+    )
+    logger.info(f"Calibrated confusion matrix saved → {output_dir / 'confusion_matrix_calibrated.png'}")
+
+    # ── Save classification_report_calibrated.csv/.json ───────────────────────
+    n_classes = len(class_names)
+    cal_class_report = classification_report(
+        y_true_eval, y_pred_cal_recommended,
+        labels=list(range(n_classes)),
+        target_names=class_names,
+        output_dict=True,
+        zero_division=0,
+    )
+    cal_rows_per_class = [
+        {
+            "class_name": name,
+            "precision":  round(float(cal_class_report.get(name, {}).get("precision", 0.0)), 4),
+            "recall":     round(float(cal_class_report.get(name, {}).get("recall", 0.0)), 4),
+            "f1-score":   round(float(cal_class_report.get(name, {}).get("f1-score", 0.0)), 4),
+            "support":    int(cal_class_report.get(name, {}).get("support", 0)),
+        }
+        for name in class_names
+    ]
+
+    csv_path = output_dir / "classification_report_calibrated.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["class_name", "precision", "recall", "f1-score", "support"]
+        )
+        writer.writeheader()
+        writer.writerows(cal_rows_per_class)
+
+    json_path = output_dir / "classification_report_calibrated.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(cal_rows_per_class, f, indent=2)
+    logger.info(f"Calibrated classification report saved → {output_dir}")
+
+    return {
+        "recommended_threshold": recommended_threshold,
+        **{f"baseline_{k}": v for k, v in base_test_metrics.items()},
+        **{f"calibrated_{k}": v for k, v in calibrated_metrics.items()},
+    }
 
 
 # ── Confusion matrix plot ──────────────────────────────────────────────────────

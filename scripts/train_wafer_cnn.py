@@ -1,21 +1,33 @@
 """Train the WaferCNN baseline on WM-811K wafer map data.
 
 Usage:
+    # default (weighted sampler, sqrt_inverse)
     python scripts/train_wafer_cnn.py
-    python scripts/train_wafer_cnn.py --epochs 50 --batch-size 128
-    python scripts/train_wafer_cnn.py --balanced-subset --samples-per-class 600
-    python scripts/train_wafer_cnn.py --class-weight-mode sqrt_inverse
-    python scripts/train_wafer_cnn.py --no-weighted-sampler
+
+    # hybrid sampling — v2 recommended config
+    python scripts/train_wafer_cnn.py --sampling-mode hybrid --epochs 10
+
+    # hybrid sampling — small/CPU-friendly version
+    python scripts/train_wafer_cnn.py \\
+        --sampling-mode hybrid \\
+        --none-samples 1000 --major-class-samples 500 \\
+        --minor-class-samples 300 --rare-class-samples 200 \\
+        --epochs 5
+
+    # balanced subset (original v1 debug mode)
+    python scripts/train_wafer_cnn.py --sampling-mode balanced --samples-per-class 600
 
 Requires data/raw/wm811k/LSWMD.pkl -- download from Kaggle:
     https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map
 
 Outputs (under outputs/reports/wafer/runs/<run_id>/):
     training_metrics.json
+    evaluation_metrics.json      -- fab-aware metrics (none_recall, false_alarm_rate, …)
+    prediction_distribution.json
     confusion_matrix_val.png
     confusion_matrix_val_normalized.png
     classification_report.csv / .json
-    evaluation_summary.json         -- includes prediction_distribution
+    evaluation_summary.json
 
 outputs/models/wafer_cnn_best.pth   -- best checkpoint by val macro F1
 
@@ -23,6 +35,8 @@ NOTE: This is a portfolio project using the public WM-811K dataset.
       Reported metrics do not represent real fab deployment performance.
       WM-811K has ~79% 'none' class; macro-F1 and per-class recall are
       the meaningful metrics. Accuracy alone is misleading.
+
+NOTE: README should be updated after v2 training result is accepted.
 """
 
 import argparse
@@ -48,47 +62,73 @@ def main(argv: list[str] | None = None) -> int:
         description="Train WaferCNN on WM-811K wafer map dataset",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data",       type=Path, default=WM811K_PKL,
+    # ── Data and model ─────────────────────────────────────────────────────────
+    parser.add_argument("--data",        type=Path,  default=WM811K_PKL,
                         help="Path to LSWMD.pkl")
-    parser.add_argument("--epochs",     type=int,   default=30)
-    parser.add_argument("--batch-size", type=int,   default=64)
-    parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--dropout",    type=float, default=0.3)
-    parser.add_argument("--device",     default="auto",
+    parser.add_argument("--epochs",      type=int,   default=30)
+    parser.add_argument("--batch-size",  type=int,   default=64)
+    parser.add_argument("--lr",          type=float, default=1e-3)
+    parser.add_argument("--weight-decay",type=float, default=1e-4)
+    parser.add_argument("--dropout",     type=float, default=0.3)
+    parser.add_argument("--device",      default="auto",
                         help="'auto', 'cpu', or 'cuda'")
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Limit total labeled samples (for quick smoke runs).")
+    parser.add_argument("--run-id",      type=str, default=None,
+                        help="Run identifier for output directory. Auto-generated if not set.")
+
+    # ── Sampling mode ──────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["hybrid", "balanced", "weighted", "none"],
+        default="weighted",
+        help=(
+            "Sampling strategy:\n"
+            "  hybrid   — class-group-aware subset (none>defect, see --*-samples);\n"
+            "             recommended for v2 false-alarm reduction\n"
+            "  balanced — uniform cap per class (see --samples-per-class)\n"
+            "  weighted — WeightedRandomSampler on full data (see --class-weight-mode)\n"
+            "  none     — raw class distribution, no rebalancing"
+        ),
+    )
     parser.add_argument(
         "--class-weight-mode",
         choices=["none", "inverse", "sqrt_inverse"],
         default="sqrt_inverse",
         help=(
-            "Sampling weight strategy for WeightedRandomSampler. "
-            "'sqrt_inverse' (default) is gentler and avoids single-class collapse. "
-            "'inverse' is aggressive and can cause collapse on WM-811K. "
-            "Ignored when --balanced-subset is set."
+            "Weight mode for WeightedRandomSampler. "
+            "Used with --sampling-mode weighted or hybrid. "
+            "'sqrt_inverse' avoids single-class collapse."
         ),
     )
-    parser.add_argument(
-        "--balanced-subset",
-        action="store_true",
-        help=(
-            "Sub-sample at most --samples-per-class examples per class and "
-            "train with shuffle=True (no WeightedRandomSampler needed). "
-            "Recommended for debugging or when collapse is observed."
-        ),
-    )
-    parser.add_argument(
-        "--samples-per-class",
-        type=int,
-        default=500,
-        help="Max samples per class when --balanced-subset is active.",
-    )
-    parser.add_argument("--no-weighted-sampler", action="store_true",
-                        help="Disable WeightedRandomSampler entirely (train on raw distribution).")
-    parser.add_argument("--max-samples", type=int, default=None,
-                        help="Limit total labeled samples (for quick smoke runs).")
-    parser.add_argument("--run-id", type=str, default=None,
-                        help="Run identifier for output directory. Auto-generated if not set.")
+
+    # ── Hybrid mode ────────────────────────────────────────────────────────────
+    parser.add_argument("--none-samples",         type=int, default=3000,
+                        help="Max none-class samples (hybrid mode).")
+    parser.add_argument("--major-class-samples",  type=int, default=1000,
+                        help="Max samples per major defect class (Edge-Ring, Edge-Loc, Center, Loc).")
+    parser.add_argument("--minor-class-samples",  type=int, default=500,
+                        help="Max samples per minor defect class (Scratch, Random, Donut).")
+    parser.add_argument("--rare-class-samples",   type=int, default=300,
+                        help="Max samples per rare class (Near-full).")
+
+    # ── Balanced mode ──────────────────────────────────────────────────────────
+    parser.add_argument("--samples-per-class", type=int, default=500,
+                        help="Max samples per class when --sampling-mode balanced.")
+
+    # ── Legacy flags (kept for backward compatibility) ─────────────────────────
+    parser.add_argument("--balanced-subset",    action="store_true",
+                        help="Equivalent to --sampling-mode balanced (legacy flag).")
+    parser.add_argument("--no-weighted-sampler",action="store_true",
+                        help="Equivalent to --sampling-mode none (legacy flag).")
+
     args = parser.parse_args(argv)
+
+    # Resolve legacy flags
+    if args.balanced_subset:
+        args.sampling_mode = "balanced"
+    if args.no_weighted_sampler:
+        args.sampling_mode = "none"
 
     # ── Data guard ─────────────────────────────────────────────────────────────
     if not args.data.exists():
@@ -122,17 +162,25 @@ def main(argv: list[str] | None = None) -> int:
     train_ds = WaferMapDataset(splits.train, augment=True)
     val_ds   = WaferMapDataset(splits.val,   augment=False)
 
-    # ── Train ──────────────────────────────────────────────────────────────────
-    use_sampler = not args.no_weighted_sampler and not args.balanced_subset
+    # ── Map sampling-mode to fit() args ───────────────────────────────────────
+    mode = args.sampling_mode
+    hybrid_subset   = (mode == "hybrid")
+    balanced_subset = (mode == "balanced")
+    use_sampler     = (mode in ("weighted", "hybrid"))
 
     print(f"\nTraining WaferCNN on {len(splits.train):,} samples")
     print(f"  Epochs={args.epochs}  batch={args.batch_size}  lr={args.lr}  device={args.device}")
-    if args.balanced_subset:
-        print(f"  Mode: balanced subset ({args.samples_per_class} samples/class)")
-    elif use_sampler:
-        print(f"  Mode: WeightedRandomSampler (class-weight-mode={args.class_weight_mode})")
-    else:
-        print(f"  Mode: no sampler (raw class distribution)")
+    print(f"  Sampling mode: {mode}")
+    if mode == "hybrid":
+        print(
+            f"  Hybrid config: none={args.none_samples}  major={args.major_class_samples}"
+            f"  minor={args.minor_class_samples}  rare={args.rare_class_samples}"
+        )
+        print(f"  Class-weight-mode (on hybrid subset): {args.class_weight_mode}")
+    elif mode == "balanced":
+        print(f"  Balanced: {args.samples_per_class} samples/class")
+    elif mode == "weighted":
+        print(f"  WeightedRandomSampler: {args.class_weight_mode}")
     print(f"\nNOTE: WM-811K has ~79% 'none' class -- macro-F1 is the key metric.")
     print(f"NOTE: This is a portfolio project. Metrics are on public WM-811K data only.\n")
 
@@ -142,23 +190,31 @@ def main(argv: list[str] | None = None) -> int:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         dropout=args.dropout,
         use_weighted_sampler=use_sampler,
         class_weight_mode=args.class_weight_mode,
-        balanced_subset=args.balanced_subset,
+        balanced_subset=balanced_subset,
         samples_per_class=args.samples_per_class,
+        hybrid_subset=hybrid_subset,
+        none_samples=args.none_samples,
+        major_class_samples=args.major_class_samples,
+        minor_class_samples=args.minor_class_samples,
+        rare_class_samples=args.rare_class_samples,
         device_str=args.device,
         class_names=list(WAFER_DEFECT_CLASSES),
         run_id=args.run_id,
     )
 
-    run_id = metrics["run_id"]
+    run_id  = metrics["run_id"]
     run_dir = f"outputs/reports/wafer/runs/{run_id}"
     print(f"\nTraining complete.  run_id={run_id}")
     print(f"  Best val macro F1 = {metrics['best_val_macro_f1']:.4f}  (epoch {metrics['best_epoch']})")
     print(f"  Checkpoint  : outputs/models/wafer_cnn_best.pth")
     print(f"  Reports dir : {run_dir}/")
     print(f"    training_metrics.json")
+    print(f"    evaluation_metrics.json      (none_recall / false_alarm_rate / …)")
+    print(f"    prediction_distribution.json")
     print(f"    confusion_matrix_val.png")
     print(f"    confusion_matrix_val_normalized.png")
     print(f"    classification_report.csv / .json")

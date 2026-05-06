@@ -16,6 +16,10 @@ Outputs (under outputs/reports/wafer/runs/<run_id>/):
     classification_report.csv / .json
     evaluation_summary.json              -- includes prediction_distribution, run_id
     evaluation_metrics.json              -- legacy per-class metrics
+    calibration_report.csv              -- threshold sweep on val split
+    calibration_summary.json            -- baseline vs. calibrated comparison
+    confusion_matrix_calibrated.png     -- calibrated test predictions
+    classification_report_calibrated.csv/.json
 
 NOTE: This is a portfolio project using the public WM-811K dataset.
       Reported metrics do not represent real fab deployment performance.
@@ -45,10 +49,12 @@ from semiconductor_yield.config import (
 from semiconductor_yield.wafer.data_loader import WM811KLoader
 from semiconductor_yield.wafer.dataset import WaferMapDataset
 from semiconductor_yield.wafer.evaluate import (
+    collect_probabilities,
     evaluate_model,
     load_model,
     plot_confusion_matrix,
     plot_confusion_matrix_normalized,
+    save_calibration_report,
     save_classification_report,
     save_evaluation_summary,
     save_misclassified,
@@ -131,12 +137,15 @@ def main(argv: list[str] | None = None) -> int:
     model = load_model(args.checkpoint, num_classes=num_classes, dropout=0.0, device=device)
     logger.info(f"Loaded checkpoint: {args.checkpoint}")
 
-    # ── Evaluate on test split ─────────────────────────────────────────────────
+    # ── Build val and test DataLoaders ────────────────────────────────────────
     from torch.utils.data import DataLoader
 
-    test_ds = WaferMapDataset(splits.test, augment=False)
+    val_ds   = WaferMapDataset(splits.val,  augment=False)
+    test_ds  = WaferMapDataset(splits.test, augment=False)
+    val_loader  = DataLoader(val_ds,  batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
+    # ── Evaluate on test split ─────────────────────────────────────────────────
     print(f"\nEvaluating on {len(splits.test):,} test samples ...")
     result = evaluate_model(model, test_loader, device, class_names)
 
@@ -205,6 +214,30 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(metrics, f, indent=2)
     logger.info(f"Saved evaluation metrics to {metrics_path}")
 
+    # ── Threshold calibration ──────────────────────────────────────────────────
+    print(f"\nRunning threshold calibration on {len(splits.val):,} val samples ...")
+    probs_val,  y_val  = collect_probabilities(model, val_loader,  device)
+    probs_test, y_test = collect_probabilities(model, test_loader, device)
+
+    cal_result = save_calibration_report(
+        probs_cal=probs_val,
+        y_true_cal=y_val,
+        probs_eval=probs_test,
+        y_true_eval=y_test,
+        class_names=class_names,
+        output_dir=report_dir,
+        thresholds=[0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    )
+    logger.info(f"Calibration complete — recommended threshold: {cal_result['recommended_threshold']}")
+
+    rec_t = cal_result["recommended_threshold"]
+    print(f"\n  Threshold calibration (recommended threshold = {rec_t}):")
+    print(f"    none_recall       : {cal_result['baseline_none_recall']:.4f}  →  {cal_result['calibrated_none_recall']:.4f}")
+    print(f"    false_alarm_rate  : {cal_result['baseline_false_alarm_rate']:.4f}  →  {cal_result['calibrated_false_alarm_rate']:.4f}")
+    print(f"    scratch_precision : {cal_result['baseline_scratch_precision']:.4f}  →  {cal_result['calibrated_scratch_precision']:.4f}")
+    print(f"    defect_recall     : {cal_result['baseline_defect_recall']:.4f}  →  {cal_result['calibrated_defect_recall']:.4f}")
+    print(f"    macro_f1          : {cal_result['baseline_macro_f1']:.4f}  →  {cal_result['calibrated_macro_f1']:.4f}")
+
     print(f"\nrun_id: {run_id}")
     print(f"Outputs saved to {report_dir}/")
     print(f"  confusion_matrix_test.png")
@@ -214,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  evaluation_summary.json")
     print(f"  misclassified.png")
     print(f"  evaluation_metrics.json")
+    print(f"  calibration_report.csv               (threshold sweep on val)")
+    print(f"  calibration_summary.json             (baseline vs. calibrated)")
+    print(f"  confusion_matrix_calibrated.png      (threshold={rec_t})")
+    print(f"  classification_report_calibrated.csv (threshold={rec_t})")
+    print(f"  classification_report_calibrated.json")
     print()
     print("NOTE: WM-811K has ~79% 'none' class -- macro-F1 and per-class recall")
     print("      are the meaningful metrics; accuracy alone is misleading.")

@@ -24,6 +24,7 @@ from semiconductor_yield.models.wafer_cnn import WaferCNN
 from semiconductor_yield.wafer.dataset import (
     WaferMapDataset,
     make_balanced_subset,
+    make_hybrid_subset,
     make_weighted_sampler,
 )
 
@@ -109,6 +110,11 @@ def fit(
     class_weight_mode: str = "sqrt_inverse",
     balanced_subset: bool = False,
     samples_per_class: int = 500,
+    hybrid_subset: bool = False,
+    none_samples: int = 3000,
+    major_class_samples: int = 1000,
+    minor_class_samples: int = 500,
+    rare_class_samples: int = 300,
     device_str: str = "auto",
     output_dir: Path | str = MODELS_DIR,
     report_dir: Path | str = WAFER_REPORTS_DIR,
@@ -133,6 +139,13 @@ def fit(
         balanced_subset: If True, sub-sample at most samples_per_class examples
             per class and train with shuffle=True (no sampler needed).
         samples_per_class: Max samples per class when balanced_subset=True.
+        hybrid_subset: If True, apply class-group-aware sampling (more none samples
+            than individual defect classes) to reduce false alarms. Takes priority
+            over balanced_subset.
+        none_samples: Max none-class samples when hybrid_subset=True.
+        major_class_samples: Max samples per major defect class.
+        minor_class_samples: Max samples per minor defect class.
+        rare_class_samples: Max samples per rare defect class.
         device_str:    ``"auto"`` picks CUDA if available, else CPU.
         output_dir:    Directory for model checkpoint.
         report_dir:    Root report directory; reports are written to
@@ -156,7 +169,31 @@ def fit(
     logger.info(f"[WaferCNN] Training on {device}")
 
     # ── DataLoaders ───────────────────────────────────────────────────────────
-    if balanced_subset:
+    if hybrid_subset:
+        hybrid_samples = make_hybrid_subset(
+            train_dataset.samples,
+            class_names=class_names,
+            none_samples=none_samples,
+            major_class_samples=major_class_samples,
+            minor_class_samples=minor_class_samples,
+            rare_class_samples=rare_class_samples,
+            seed=RANDOM_SEED,
+        )
+        logger.info(
+            f"[WaferCNN] Hybrid subset: {len(hybrid_samples):,} samples "
+            f"(none={none_samples}, major={major_class_samples}, "
+            f"minor={minor_class_samples}, rare={rare_class_samples})"
+        )
+        train_dataset = WaferMapDataset(hybrid_samples, augment=True)
+        if use_weighted_sampler and class_weight_mode != "none":
+            sampler = make_weighted_sampler(train_dataset, mode=class_weight_mode)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+        else:
+            train_loader = DataLoader(
+                train_dataset, batch_size=batch_size, shuffle=True,
+                generator=torch.Generator().manual_seed(RANDOM_SEED),
+            )
+    elif balanced_subset:
         balanced_samples = make_balanced_subset(
             train_dataset.samples, samples_per_class, seed=RANDOM_SEED
         )
@@ -240,7 +277,19 @@ def fit(
         )
 
     # ── Save metrics ───────────────────────────────────────────────────────────
-    effective_weight_mode = class_weight_mode if (use_weighted_sampler and not balanced_subset) else "none"
+    if hybrid_subset:
+        effective_weight_mode = class_weight_mode if (use_weighted_sampler and class_weight_mode != "none") else "none"
+        sampling_mode = "hybrid"
+    elif balanced_subset:
+        effective_weight_mode = "none"
+        sampling_mode = "balanced"
+    elif use_weighted_sampler and class_weight_mode != "none":
+        effective_weight_mode = class_weight_mode
+        sampling_mode = "weighted"
+    else:
+        effective_weight_mode = "none"
+        sampling_mode = "none"
+
     metrics = {
         "disclaimer": (
             "Metrics on WM-811K public dataset (portfolio project -- "
@@ -248,16 +297,22 @@ def fit(
         ),
         "run_id": run_id,
         "training_config": {
-            "epochs":             epochs,
-            "batch_size":         batch_size,
-            "lr":                 lr,
-            "weight_decay":       weight_decay,
-            "balanced_subset":    balanced_subset,
-            "samples_per_class":  samples_per_class if balanced_subset else None,
-            "class_weight_mode":  effective_weight_mode,
-            "device":             str(device),
-            "n_train":            n_train,
-            "n_val":              len(val_dataset),
+            "epochs":               epochs,
+            "batch_size":           batch_size,
+            "lr":                   lr,
+            "weight_decay":         weight_decay,
+            "sampling_mode":        sampling_mode,
+            "balanced_subset":      balanced_subset,
+            "samples_per_class":    samples_per_class if balanced_subset else None,
+            "hybrid_subset":        hybrid_subset,
+            "none_samples":         none_samples if hybrid_subset else None,
+            "major_class_samples":  major_class_samples if hybrid_subset else None,
+            "minor_class_samples":  minor_class_samples if hybrid_subset else None,
+            "rare_class_samples":   rare_class_samples if hybrid_subset else None,
+            "class_weight_mode":    effective_weight_mode,
+            "device":               str(device),
+            "n_train":              n_train,
+            "n_val":                len(val_dataset),
         },
         "best_epoch":        best_epoch,
         "best_val_macro_f1": round(best_val_f1, 4),
@@ -283,6 +338,7 @@ def _save_val_reports(
     n_train: int = 0,
 ) -> None:
     from semiconductor_yield.wafer.evaluate import (
+        compute_fab_metrics,
         evaluate_model,
         plot_confusion_matrix,
         plot_confusion_matrix_normalized,
@@ -311,3 +367,48 @@ def _save_val_reports(
         n_samples=len(result.y_true), run_id=run_id, n_train=n_train,
     )
     logger.info(f"[WaferCNN] Evaluation summary saved to {run_report_dir}")
+
+    # ── evaluation_metrics.json (fab-aware metrics for comparison tool) ───────
+    fab = compute_fab_metrics(result.y_true, result.y_pred, class_names)
+    eval_metrics = {
+        "disclaimer": (
+            "Metrics on WM-811K public dataset (portfolio project -- "
+            "not real fab production performance)."
+        ),
+        "run_id":         run_id,
+        "split":          "val",
+        "n_samples":      int(len(result.y_true)),
+        "accuracy":       round(result.accuracy, 4),
+        "macro_f1":       round(result.macro_f1, 4),
+        "macro_precision": result.macro_precision,
+        "macro_recall":    result.macro_recall,
+        "weighted_f1":    result.weighted_f1,
+        **fab,   # none_recall, false_alarm_rate, defect_recall, scratch_precision, scratch_recall
+        "per_class": result.per_class,
+    }
+    eval_path = run_report_dir / "evaluation_metrics.json"
+    with open(eval_path, "w", encoding="utf-8") as f:
+        json.dump(eval_metrics, f, indent=2)
+    logger.info(f"[WaferCNN] Evaluation metrics saved to {eval_path}")
+
+    # ── prediction_distribution.json ─────────────────────────────────────────
+    n_classes = len(class_names)
+    n_pred = max(len(result.y_pred), 1)
+    pred_counts = np.bincount(result.y_pred, minlength=n_classes)
+    true_counts = np.bincount(result.y_true, minlength=n_classes)
+    dist = {
+        "run_id": run_id,
+        "split":  "val",
+        "prediction_distribution": {
+            class_names[i]: round(float(pred_counts[i] / n_pred), 4)
+            for i in range(n_classes)
+        },
+        "true_distribution": {
+            class_names[i]: round(float(true_counts[i] / n_pred), 4)
+            for i in range(n_classes)
+        },
+    }
+    dist_path = run_report_dir / "prediction_distribution.json"
+    with open(dist_path, "w", encoding="utf-8") as f:
+        json.dump(dist, f, indent=2)
+    logger.info(f"[WaferCNN] Prediction distribution saved to {dist_path}")

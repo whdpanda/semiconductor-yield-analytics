@@ -122,6 +122,102 @@ def make_weighted_sampler(
     )
 
 
+# ── WM-811K class group defaults ──────────────────────────────────────────────
+# Groupings reflect approximate class frequencies in the labeled WM-811K split:
+#   none      ~79% (~86k),  major defects ~17% (~18k),
+#   minor defects ~3% (~3k), rare <0.3% (~450 combined)
+_WM811K_NONE_CLASSES:  tuple[str, ...] = ("none",)
+_WM811K_MAJOR_CLASSES: tuple[str, ...] = ("Edge-Ring", "Edge-Loc", "Center", "Loc")
+_WM811K_MINOR_CLASSES: tuple[str, ...] = ("Scratch", "Random", "Donut")
+_WM811K_RARE_CLASSES:  tuple[str, ...] = ("Near-full",)
+
+
+def make_hybrid_subset(
+    samples: list[WaferSample],
+    class_names: list[str],
+    none_samples: int = 3000,
+    major_class_samples: int = 1000,
+    minor_class_samples: int = 500,
+    rare_class_samples: int = 300,
+    none_classes: tuple[str, ...] | None = None,
+    major_classes: tuple[str, ...] | None = None,
+    minor_classes: tuple[str, ...] | None = None,
+    rare_classes: tuple[str, ...] | None = None,
+    seed: int = RANDOM_SEED,
+) -> list[WaferSample]:
+    """Build a class-aware hybrid subset for false-alarm-aware training.
+
+    Unlike make_balanced_subset (uniform cap per class), this function applies
+    different caps to semantically defined groups:
+
+    - none class(es)   : ``none_samples`` cap (kept larger to anchor the decision
+                          boundary toward normal and reduce false alarms)
+    - major defect     : ``major_class_samples`` per class (common, less oversampling)
+    - minor defect     : ``minor_class_samples`` per class (less common, more oversampling)
+    - rare             : ``rare_class_samples`` per class (rarest, cap ≤ available)
+    - unknown groups   : ``major_class_samples`` fallback
+
+    The none class always retains more samples than any individual defect class,
+    reflecting the real fab cost of false alarms versus missed defects.
+
+    Default WM-811K class groups (override via *_classes kwargs):
+      none    = ("none",)
+      major   = ("Edge-Ring", "Edge-Loc", "Center", "Loc")
+      minor   = ("Scratch", "Random", "Donut")
+      rare    = ("Near-full",)
+
+    Args:
+        samples:              Full list of training samples (pre-split).
+        class_names:          Ordered list of class name strings, index = label int.
+        none_samples:         Max samples for none class(es).
+        major_class_samples:  Max samples per major defect class.
+        minor_class_samples:  Max samples per minor defect class.
+        rare_class_samples:   Max samples per rare defect class.
+        none_classes:         Names treated as "none". Defaults to WM-811K groups.
+        major_classes:        Names treated as major defect.
+        minor_classes:        Names treated as minor defect.
+        rare_classes:         Names treated as rare defect.
+        seed:                 RNG seed for reproducibility.
+
+    Returns:
+        Hybrid-sampled subset with none_samples > any individual defect class cap.
+    """
+    if none_classes  is None: none_classes  = _WM811K_NONE_CLASSES
+    if major_classes is None: major_classes = _WM811K_MAJOR_CLASSES
+    if minor_classes is None: minor_classes = _WM811K_MINOR_CLASSES
+    if rare_classes  is None: rare_classes  = _WM811K_RARE_CLASSES
+
+    def _cap(name: str) -> int:
+        if name in none_classes:   return none_samples
+        if name in major_classes:  return major_class_samples
+        if name in minor_classes:  return minor_class_samples
+        if name in rare_classes:   return rare_class_samples
+        return major_class_samples  # safe fallback
+
+    label_to_cap: dict[int, int] = {
+        i: _cap(class_names[i])
+        for i in range(len(class_names))
+        if i < len(class_names)
+    }
+
+    rng = np.random.default_rng(seed)
+    by_class: dict[int, list[WaferSample]] = {}
+    for s in samples:
+        by_class.setdefault(s.label, []).append(s)
+
+    result: list[WaferSample] = []
+    for cls_idx in sorted(by_class):
+        cls_samples = by_class[cls_idx]
+        cap = label_to_cap.get(cls_idx, major_class_samples)
+        if len(cls_samples) <= cap:
+            result.extend(cls_samples)
+        else:
+            chosen = rng.choice(len(cls_samples), size=cap, replace=False)
+            result.extend(cls_samples[i] for i in chosen)
+
+    return result
+
+
 def make_balanced_subset(
     samples: list[WaferSample],
     samples_per_class: int = 500,

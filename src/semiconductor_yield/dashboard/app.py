@@ -11,6 +11,7 @@ Not a production fab system.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -30,6 +31,8 @@ from semiconductor_yield.config import (
     RANDOM_SEED,
     SYNTHETIC_DIR,
     WAFER_DEFECT_CLASSES,
+    WAFER_REPORTS_DIR,
+    WM811K_PKL,
 )
 from semiconductor_yield.dashboard.data_helpers import (
     format_rca_candidates,
@@ -53,15 +56,23 @@ st.set_page_config(
 )
 
 # ── File paths ─────────────────────────────────────────────────────────────────
-_SPC_CSV       = PROCESS_REPORTS_DIR / "spc_violations.csv"
-_SCORES_CSV    = PROCESS_REPORTS_DIR / "anomaly_scores.csv"
-_SUMMARY_JSON  = PROCESS_REPORTS_DIR / "anomaly_summary.json"
-_PROCESS_CSV   = SYNTHETIC_DIR / "process_data.csv"
-_CHARTS_DIR    = PROCESS_REPORTS_DIR / "charts"
-_CHECKPOINT    = MODELS_DIR / "wafer_cnn_best.pth"
+_SPC_CSV          = PROCESS_REPORTS_DIR / "spc_violations.csv"
+_SCORES_CSV       = PROCESS_REPORTS_DIR / "anomaly_scores.csv"
+_SUMMARY_JSON     = PROCESS_REPORTS_DIR / "anomaly_summary.json"
+_PROCESS_CSV      = SYNTHETIC_DIR / "process_data.csv"
+_CHARTS_DIR       = PROCESS_REPORTS_DIR / "charts"
+_CHECKPOINT       = MODELS_DIR / "wafer_cnn_best.pth"
+_ACTIVE_RUN_JSON  = Path(WAFER_REPORTS_DIR) / "active_run.json"
 
 
 # ── Streamlit-cached data loaders ─────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def _active_run() -> dict | None:
+    if not _ACTIVE_RUN_JSON.exists():
+        return None
+    with open(_ACTIVE_RUN_JSON, encoding="utf-8") as f:
+        return json.load(f)
 
 @st.cache_data(show_spinner=False)
 def _spc_violations() -> pd.DataFrame | None:
@@ -79,13 +90,56 @@ def _anomaly_summary() -> dict | None:
 def _process_data() -> pd.DataFrame | None:
     return load_process_data(_PROCESS_CSV)
 
+def _resolve_checkpoint() -> Path:
+    """Return checkpoint from active_run.json (checkpoint_stable), else _CHECKPOINT."""
+    if _ACTIVE_RUN_JSON.exists():
+        try:
+            with open(_ACTIVE_RUN_JSON, encoding="utf-8") as _f:
+                _run = json.load(_f)
+            _rel = _run.get("checkpoint_stable") or _run.get("checkpoint_live")
+            if _rel:
+                _root = Path(__file__).resolve().parent.parent.parent
+                _p = _root / _rel
+                if _p.exists():
+                    return _p
+        except Exception:
+            pass
+    return _CHECKPOINT
+
+
 @st.cache_resource(show_spinner="Loading model ...")
-def _wafer_engine() -> tuple[WaferInference, bool]:
-    """Returns (engine, is_demo). Cached for session lifetime."""
+def _wafer_engine() -> tuple[WaferInference, bool, Path]:
+    """Returns (engine, is_demo, loaded_checkpoint_path). Cached for session lifetime."""
+    ckpt = _resolve_checkpoint()
     try:
-        return WaferInference.from_checkpoint(_CHECKPOINT), False
+        return WaferInference.from_checkpoint(ckpt), False, ckpt
     except FileNotFoundError:
-        return WaferInference.demo(), True
+        try:
+            return WaferInference.from_checkpoint(_CHECKPOINT), False, _CHECKPOINT
+        except FileNotFoundError:
+            return WaferInference.demo(), True, _CHECKPOINT
+
+
+@st.cache_resource(show_spinner="Loading WM-811K test samples ...")
+def _wm811k_test_by_class() -> dict[str, list] | None:
+    """Load WM-811K and return {class_name: [WaferSample, ...]} for the test split.
+
+    Returns None if LSWMD.pkl is not present.
+    """
+    if not WM811K_PKL.exists():
+        return None
+    try:
+        from semiconductor_yield.wafer.data_loader import WM811KLoader
+        from semiconductor_yield.wafer.preprocess import stratified_split
+        loader = WM811KLoader(pkl_path=WM811K_PKL)
+        samples = loader.load(labeled_only=True)
+        splits = stratified_split(samples)
+        by_class: dict[str, list] = {}
+        for s in splits.test:
+            by_class.setdefault(s.label_name, []).append(s)
+        return by_class
+    except Exception:
+        return None
 
 
 # ── Figure builders ────────────────────────────────────────────────────────────
@@ -199,9 +253,10 @@ def page_home() -> None:
     with col_a:
         st.subheader("Module A — Wafer Map Classification")
         st.markdown("""
-- **Model:** WaferCNN, 3 conv blocks + Global Average Pooling, ~94K params
-- **Dataset:** WM-811K public dataset, 9 defect pattern classes
-- **Class imbalance:** ~79% "none" class → WeightedRandomSampler + macro F1
+- **Model:** WaferCNN v2, 3 conv blocks + Global Average Pooling, ~94K params
+- **Dataset:** WM-811K public dataset (portfolio baseline), 9 defect pattern classes
+- **Sampling:** Hybrid class-group-aware caps (none > major > minor > rare) + macro F1
+- **Baseline result:** accuracy 0.9430, macro-F1 0.7312, none recall 0.9711, false alarm rate 0.0289
 - **Demo mode:** works without WM-811K data (synthetic patterns)
         """)
 
@@ -256,49 +311,129 @@ def page_wafer() -> None:
     st.header("Wafer Map Defect Classification")
     _data_disclaimer()
 
-    engine, is_demo = _wafer_engine()
+    # ── CNN v2 model performance panel ────────────────────────────────────────
+    run_data = _active_run()
+    if run_data:
+        m = run_data.get("metrics", {})
+        cal = run_data.get("calibration", {})
+        with st.expander("Model Performance — Hybrid Sampling CNN v2 (portfolio baseline)", expanded=True):
+            st.caption(
+                f"run_id: `{run_data.get('active_run_id', '—')}` · "
+                f"model: `{run_data.get('model_name', '—')}` · "
+                "evaluation split: test · WM-811K public dataset"
+            )
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Accuracy",         f"{m.get('accuracy', 0):.4f}")
+            c2.metric("Macro F1",         f"{m.get('macro_f1', 0):.4f}")
+            c3.metric("None Recall",      f"{m.get('none_recall', 0):.4f}")
+            c4.metric("False Alarm Rate", f"{m.get('false_alarm_rate', 0):.4f}")
+            c5.metric("Defect Recall",    f"{m.get('defect_recall', 0):.4f}")
 
+            st.divider()
+            st.markdown("**Threshold Calibration — low-false-alarm operating point**")
+            t = cal.get("low_false_alarm_threshold", "—")
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Threshold",                  str(t))
+            cc2.metric("None Recall (calibrated)",   f"{cal.get('calibrated_none_recall', 0):.4f}")
+            cc3.metric("False Alarm (calibrated)",   f"{cal.get('calibrated_false_alarm_rate', 0):.4f}")
+            st.info(cal.get("note", ""))
+            st.caption(run_data.get("disclaimer", ""))
+
+    # ── Model status bar ──────────────────────────────────────────────────────
+    engine, is_demo, loaded_ckpt = _wafer_engine()
     if is_demo:
         st.warning(
-            f"**Demo mode** — checkpoint not found at `{_CHECKPOINT}`.\n\n"
+            "**Demo mode** — checkpoint not found. "
             "Predictions use randomly initialised weights and are **meaningless**. "
             "Train first: `python scripts/train_wafer_cnn.py`"
         )
     else:
-        st.success(f"Trained model loaded · `{_CHECKPOINT.name}`")
+        run_id_str   = run_data.get("active_run_id", "—") if run_data else "—"
+        model_str    = run_data.get("model_name",    "—") if run_data else "—"
+        st.success(
+            f"Model loaded · `{loaded_ckpt.name}` · "
+            f"Model: **{model_str}** · Active run: `{run_id_str}`"
+        )
 
+    # ── Input section ─────────────────────────────────────────────────────────
     ctrl, vis, pred = st.columns([1, 2, 2], gap="medium")
 
     with ctrl:
         st.subheader("Input")
-        source = st.radio("Source", ["Demo sample", "Upload file"],
-                          label_visibility="collapsed")
+        source = st.radio(
+            "Source",
+            ["Real WM-811K test sample", "Synthetic illustration", "Upload file"],
+            label_visibility="collapsed",
+        )
 
-        if source == "Demo sample":
+        # ── Real WM-811K test sample ──────────────────────────────────────────
+        if source == "Real WM-811K test sample":
+            test_by_class = _wm811k_test_by_class()
+            if test_by_class is None:
+                st.warning(
+                    f"WM-811K data not found at `{WM811K_PKL}`.\n\n"
+                    "Download LSWMD.pkl from Kaggle and place it at "
+                    "`data/raw/wm811k/LSWMD.pkl` to enable real-sample mode.\n\n"
+                    "Use **Synthetic illustration** or **Upload file** instead."
+                )
+            else:
+                cls = st.selectbox("True defect class", list(WAFER_DEFECT_CLASSES))
+                n_avail = len(test_by_class.get(cls, []))
+                seed = st.number_input(
+                    f"Sample index (0 – {max(0, n_avail - 1)})",
+                    value=0, min_value=0, max_value=max(0, n_avail - 1),
+                )
+                st.caption(f"{n_avail} test samples available for class **{cls}**")
+                if st.button("Sample", type="primary"):
+                    cls_samples = test_by_class[cls]
+                    sample = cls_samples[int(seed) % len(cls_samples)]
+                    st.session_state.update(
+                        w_map=sample.wafer_map,
+                        w_synthetic=False,
+                        w_true_label=sample.label_name,
+                        w_label=f"Real · {sample.label_name} · index {int(seed)}",
+                    )
+
+        # ── Synthetic illustration ────────────────────────────────────────────
+        elif source == "Synthetic illustration":
+            st.warning(
+                "**Illustration only.** These patterns are hand-crafted geometric "
+                "approximations of WM-811K defect classes. They are "
+                "out-of-distribution relative to real wafer maps and may be "
+                "misclassified. Do not use them to judge model accuracy."
+            )
             cls = st.selectbox("Defect class", list(WAFER_DEFECT_CLASSES))
             seed = st.number_input("Seed", value=42, min_value=0, max_value=9999)
             if st.button("Generate", type="primary"):
                 wm = generate_demo_sample(cls, seed=int(seed))
                 st.session_state.update(
-                    w_map=wm, w_synthetic=True,
-                    w_label=f"{cls} (seed={int(seed)})"
+                    w_map=wm,
+                    w_synthetic=True,
+                    w_true_label=None,
+                    w_label=f"Synthetic · {cls} (seed={int(seed)})",
                 )
+
+        # ── Upload file ───────────────────────────────────────────────────────
         else:
-            f = st.file_uploader("Upload .npy / .pkl / .csv",
-                                 type=["npy", "pkl", "csv"])
-            if f is not None:
+            up = st.file_uploader("Upload .npy / .pkl / .csv",
+                                  type=["npy", "pkl", "csv"])
+            if up is not None:
                 try:
-                    wm = parse_wafer_input(f.read(), filename=f.name)
+                    wm = parse_wafer_input(up.read(), filename=up.name)
                     st.session_state.update(
-                        w_map=wm, w_synthetic=False, w_label=f.name
+                        w_map=wm,
+                        w_synthetic=False,
+                        w_true_label=None,
+                        w_label=up.name,
                     )
                 except ValueError as exc:
                     st.error(str(exc))
 
+    # ── Prediction panel ──────────────────────────────────────────────────────
     wmap = st.session_state.get("w_map")
     if wmap is None:
         with vis:
-            st.info("Select a demo sample or upload a file.")
+            st.info("Select a source above and click Sample / Generate.")
         return
 
     result = engine.predict(wmap, top_k=5)
@@ -306,18 +441,49 @@ def page_wafer() -> None:
     with vis:
         st.subheader("Wafer Map")
         st.caption(st.session_state.get("w_label", ""))
-        fig = _wafer_figure(wmap, is_synthetic=st.session_state.get("w_synthetic", False))
+        is_syn = st.session_state.get("w_synthetic", False)
+        fig = _wafer_figure(wmap, is_synthetic=is_syn)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
         st.caption("dark = background  |  green = good die  |  red = defective die")
+        if is_syn:
+            st.caption(
+                "_Synthetic illustration — out-of-distribution relative to WM-811K. "
+                "Not suitable for accuracy evaluation._"
+            )
 
     with pred:
         st.subheader("Prediction")
         if result.is_demo:
             st.warning("Untrained model — predictions are meaningless (demo mode)")
-        c1, c2 = st.columns(2)
-        c1.metric("Predicted class", result.predicted_class)
-        c2.metric("Confidence", f"{result.confidence:.1%}")
+
+        true_label = st.session_state.get("w_true_label")
+
+        if true_label is not None:
+            # Real WM-811K sample — show comparison
+            is_correct = result.predicted_class == true_label
+            r1, r2, r3 = st.columns(3)
+            r1.metric("True label",      true_label)
+            r2.metric("Predicted label", result.predicted_class)
+            r3.metric("Confidence",      f"{result.confidence:.1%}")
+            if is_correct:
+                st.success("Correct prediction")
+            else:
+                st.error(
+                    f"Incorrect — true: **{true_label}**, "
+                    f"predicted: **{result.predicted_class}**"
+                )
+        else:
+            # Synthetic or upload — no true label to compare
+            c1, c2 = st.columns(2)
+            c1.metric("Predicted class", result.predicted_class)
+            c2.metric("Confidence",      f"{result.confidence:.1%}")
+            if is_syn:
+                st.caption(
+                    "_Synthetic sample — correct/incorrect comparison is not "
+                    "meaningful. Use Real WM-811K test sample mode to validate._"
+                )
+
         st.markdown("**Top-5 probabilities**")
         pf = _prob_figure(result.top_k, result.predicted_class)
         st.pyplot(pf, use_container_width=True)
@@ -618,8 +784,10 @@ signal and cause systematic false alarms or blind spots for specific tools.
 WM-811K has ~79% "none" class. Accuracy is meaningless here — a classifier predicting
 "none" for every sample achieves 79% without learning anything.
 
-**In this project:** WeightedRandomSampler re-balances gradient signal; primary metric is
-macro F1. Per-class F1 and recall are the production-relevant numbers.
+**In this project (v2):** Hybrid class-group-aware sampling (none > major defects > minor
+defects > rare defects) anchors the decision boundary toward normal wafers. Primary metric
+is macro F1. Per-class F1 and recall are the production-relevant numbers.
+Portfolio baseline result: macro-F1 0.7312, none recall 0.9711, false alarm rate 0.0289.
 
 **In production:** Cost-aware threshold calibration per class. Missing an Edge-Ring fault
 (systematic equipment issue) is typically far more expensive than a false Loc alarm.
