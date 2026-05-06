@@ -1,328 +1,398 @@
 # Semiconductor Yield & Process Analytics Platform
 
-A full-stack data engineering and machine learning project demonstrating two core competencies
-in semiconductor manufacturing analytics:
+A portfolio project integrating **wafer map defect classification**, **statistical process control**, **ML anomaly detection**, and **RCA-style candidate analysis** — demonstrating semiconductor domain understanding combined with Python data engineering and machine learning.
 
-1. **Wafer Map Defect Classification** — CNN-based classification of 9 defect pattern types on the
-   public WM-811K dataset, with class imbalance handling, Grad-CAM explainability, and an
-   interactive Streamlit demo.
-2. **SPC + Process Anomaly Detection** — Statistical Process Control pipeline implementing
-   Western Electric Rules combined with ML-based anomaly detection (Isolation Forest + Autoencoder),
-   visualized in an interactive dashboard.
-
-> **Data disclosure:** This project uses the WM-811K public dataset and simulated process data.
-> All reported metrics are on these datasets only and do not represent real fab production performance.
+> **Data & results disclaimer:**  
+> Module A uses the **public WM-811K wafer map dataset**. Module B uses **synthetically generated process data**.  
+> All metrics reflect these datasets only and do not represent real fab production performance.  
+> This project is not production-ready and has not been validated in a real semiconductor facility.
 
 ---
 
-## Architecture
+## Why This Project
+
+This project connects two areas of my background:
+
+- **Semiconductor / materials-device domain knowledge** — research experience in spintronics and device physics, providing familiarity with wafer-level concepts, process steps (lithography, CMP, etch, deposition), yield analysis, and SPC practices.
+- **Software engineering and ML skills** — Python data pipeline development, PyTorch CNN training, scikit-learn anomaly detection, Streamlit dashboards, and test-driven development.
+
+The goal is to demonstrate that I can reason about both the domain context and the engineering implementation — not just run models, but understand why specific metrics (macro-F1, none recall, false alarm rate) matter in manufacturing analytics.
+
+---
+
+## Target Roles
+
+This project is designed to support applications for:
+
+- Yield Engineer / Yield Data Engineer
+- Process Data Engineer / Process Control Engineer
+- Semiconductor Data Analyst
+- Semiconductor AI / ML Engineer
+- Manufacturing Data Scientist
+- Smart Factory / Manufacturing DX Engineer
+
+---
+
+## System Overview
 
 ```
-semiconductor-yield-analytics/
-├── src/semiconductor_yield/      # Core Python package
-│   ├── config.py                 # Central path & parameter config
-│   ├── data/                     # Data loading utilities
-│   ├── wafer/                    # Module A: wafer map classification
-│   ├── process/                  # Module B: SPC & anomaly detection
-│   ├── models/                   # CNN, Autoencoder, IsolationForest wrapper
-│   ├── dashboard/                # Streamlit UI components
-│   └── utils/                    # Shared utilities
-├── scripts/                      # CLI entry points (train, evaluate, generate)
-├── app/                          # Streamlit application
-├── configs/                      # YAML hyperparameter configs
-├── tests/                        # pytest test suite
-├── notebooks/                    # EDA notebooks (read-only, not production code)
-└── docs/                         # Design docs, data contract, interview notes
+Module A: Wafer Map Defect Classification
+──────────────────────────────────────────
+  WM-811K public dataset (LSWMD.pkl)
+       │
+       ▼
+  Exploratory Data Analysis (run_wafer_eda.py)
+  → class distribution, imbalance report, sample maps
+       │
+       ▼
+  Hybrid Sampling CNN v2 (train_wafer_cnn.py)
+  → class-group-aware caps (none > major > minor > rare)
+  → WaferCNN: 3 conv blocks + Global Average Pooling, ~94K params
+       │
+       ▼
+  Evaluation (evaluate_wafer_cnn.py)
+  → test-split metrics: accuracy, macro-F1, none recall,
+    false alarm rate, defect recall, per-class recall
+  → threshold calibration sweep (val → test)
+       │
+       ▼
+  compare_wafer_runs.py  ←  run comparison / versioning
+       │
+       ▼
+  Integrated Dashboard (app.py)
+
+Module B: SPC + Anomaly Detection + RCA
+────────────────────────────────────────
+  Simulated process data (generate_synthetic_process_data.py)
+  → 5 process steps, 8 sensor/metrology features, 50 lots
+       │
+       ├──▶  SPC Analysis (run_spc_analysis.py)
+       │     → Western Electric Rules 1–4 (step-aware)
+       │     → control charts, violation events, severity
+       │
+       ├──▶  ML Anomaly Detection (train/evaluate_process_anomaly.py)
+       │     → Isolation Forest + Autoencoder (unsupervised)
+       │     → lot_id-grouped split, no target leakage
+       │     → ensemble voting (any / all)
+       │
+       └──▶  RCA-style Candidate Analysis (run_process_rca.py)
+             → ranked candidate steps, suspicious features,
+               evidence, recommended checks, limitation note
+             │
+             ▼
+       Integrated Dashboard (app.py)
 ```
+
+---
+
+## Data Sources and Disclaimer
+
+| Source | Type | Included in repo? |
+|--------|------|-------------------|
+| WM-811K wafer map dataset | Public (Kaggle / MiraCle research) | **No** — download required (~350 MB) |
+| Synthetic process data | Generated by `generate_synthetic_process_data.py` | Yes (`data/synthetic/process_data.csv`) |
+
+**WM-811K:** A public research dataset of 811,457 wafer maps with 9 defect pattern classes. It is not proprietary fab data. Metrics on this dataset reflect dataset properties, not real fab deployment performance.
+
+**Synthetic process data:** Simulated 5-step process with controlled anomaly injection (temperature drift, pressure spikes). It does not represent real tool data from any fab. SPC and anomaly detection results validate pipeline logic on this simulation only.
+
+**RCA output:** All RCA outputs are candidate analysis results — suspected process steps ranked by SPC and anomaly signal synergy. They are NOT confirmed root causes. Confirming a root cause in a real fab requires process engineer review of recipe files, tool logs, metrology raw data, and consumable records.
 
 ---
 
 ## Module A: Wafer Map Defect Classification
 
-### Background
-
-In semiconductor fabs, every wafer undergoes electrical testing (E-Test) after fabrication.
-The spatial pattern of failing dies on a wafer map is a key diagnostic signal — different
-failure patterns (e.g., edge ring, scratch, center cluster) correspond to different root causes
-in the process flow (lithography, CMP, etch, contamination, etc.).
-
-Manual pattern classification is time-consuming and inconsistent across engineers.
-An automated classifier accelerates root-cause analysis and enables real-time yield monitoring.
-
 ### Dataset
 
-- **WM-811K** (MiraCle research group): 811,457 wafer maps, 9 defect pattern classes
-- Severe class imbalance: `none` class ~79%; `Near-Full` class ~0.08%
-- Public dataset — not proprietary fab data
+**WM-811K** (MiraCle research group): ~811K wafer maps total, ~172K with defect pattern labels, 9 classes.
 
-### Approach
+**Severe class imbalance** (labeled subset):
 
-| Component | Choice | Rationale |
-|-----------|--------|-----------|
-| Architecture | WaferCNN (3 conv blocks + GAP, ~94K params) | Lightweight baseline; runs on CPU; no pretrained weights needed |
-| Loss function | CrossEntropyLoss | Standard multi-class loss; class imbalance handled by sampler |
-| Sampling | `WeightedRandomSampler` | Equalises class frequency per batch; preferred over loss-weighting at extreme imbalance |
-| Augmentation | Random 90° rotation, horizontal/vertical flip | Exploits wafer rotational symmetry; preserves discrete {0,1,2} values |
-| Primary metric | Macro F1 | Equal weight across all 9 classes; accuracy is misleading at 79% imbalance |
-| LR schedule | CosineAnnealingLR | Smooth decay without manual step tuning |
+| Class | Approx. count | % |
+|-------|--------------|---|
+| none | ~147,000 | 79% |
+| Edge-Ring | ~9,700 | 5.2% |
+| Edge-Loc | ~5,200 | 2.8% |
+| Center | ~4,300 | 2.3% |
+| Loc | ~3,600 | 1.9% |
+| Random | ~870 | 0.5% |
+| Scratch | ~1,200 | 0.6% |
+| Donut | ~555 | 0.3% |
+| Near-full | ~149 | 0.08% |
 
-### Data Preparation
+`none` accounts for ~79% of labeled samples. Accuracy alone is therefore misleading — a degenerate classifier that always predicts `none` achieves ~79% accuracy without learning anything. **Macro-F1 and per-class recall are the primary evaluation metrics.**
 
-**Step 1 — Download WM-811K**
+### EDA
 
-The dataset is not bundled with this repository. Download manually from Kaggle:
-
-```
-https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map
-```
-
-Place the file at `data/raw/wm811k/LSWMD.pkl` (~350 MB). If the file is missing,
-all Module A scripts will print a clear download instruction and exit.
-
-**Step 2 — Run EDA**
-
-```bash
+```powershell
+# Full EDA (requires data/raw/wm811k/LSWMD.pkl)
 python scripts/run_wafer_eda.py
-```
 
-Outputs saved to `outputs/reports/wafer/`:
-
-| File | Description |
-|------|-------------|
-| `class_distribution.csv` | Count and percentage per defect class |
-| `class_distribution.png` | Horizontal bar chart (labeled wafers only) |
-| `imbalance_report.csv` | Per-class count, imbalance ratio, and balanced weight |
-| `sample_wafer_maps.png` | 9 × 3 grid of example wafer maps per class |
-| `wafer_map_sizes.csv` | Distribution of raw wafer map dimensions |
-
-For a fast smoke run without loading all 172k samples:
-
-```bash
+# Fast smoke run
 python scripts/run_wafer_eda.py --max-samples 5000
 ```
 
-**Class imbalance (labeled subset ~172k wafers)**
+Outputs (`outputs/reports/wafer/`): `class_distribution.csv`, `class_distribution.png`, `imbalance_report.csv`, `sample_wafer_maps.png`, `wafer_map_sizes.csv`.
 
-| Class | Count | % |
-|-------|-------|---|
-| none | ~147k | 79% |
-| Edge-Ring | ~9.7k | 5.2% |
-| Edge-Loc | ~5.2k | 2.8% |
-| … | … | … |
-| Near-Full | ~149 | 0.08% |
+### Model: Hybrid Sampling CNN v2
 
-Macro F1 is used as the primary training metric because accuracy would be 79%
-even for a degenerate "predict none" classifier.
+**Architecture:** WaferCNN — 3 convolutional blocks (Conv→BN→ReLU→MaxPool) followed by Global Average Pooling and a linear classifier. Approximately 94K parameters. Designed as a lightweight CPU-runnable baseline; not a SOTA architecture.
 
-### Training and Evaluation
+**Sampling strategy (v2 — hybrid):**
 
-**Train (requires `data/raw/wm811k/LSWMD.pkl`):**
+Instead of uniform weighting, v2 applies class-group-aware sampling caps before training:
 
-```bash
-# Default: 30 epochs, batch 64, Adam lr=1e-3, WeightedRandomSampler enabled
-python scripts/train_wafer_cnn.py
+| Group | Classes | Cap |
+|-------|---------|-----|
+| None class | `none` | 3,000 |
+| Major defects | Edge-Ring, Edge-Loc, Center, Loc | 1,000 per class |
+| Minor defects | Scratch, Random, Donut | 500 per class |
+| Rare | Near-full | 300 |
 
-# Faster smoke run (subsamples 5 000 labeled wafers)
-python scripts/train_wafer_cnn.py --max-samples 5000 --epochs 5
+After subsetting, a `sqrt_inverse` WeightedRandomSampler further re-balances the training batches. This anchors the decision boundary toward normal wafers, directly reducing false alarms on clean wafers while retaining representation of rare defect classes.
 
-# Longer run
-python scripts/train_wafer_cnn.py --epochs 50 --batch-size 128
+**Active run:** `run_20260506_113713` | Checkpoint: `outputs/models/wafer_cnn_v2_hybrid_best.pth`
+
+### Module A Results (test split, WM-811K public dataset)
+
+> Metrics on the held-out **test split** (n=25,943 samples, same seed-42 stratified split used for all runs).  
+> This is a portfolio baseline. Results reflect dataset properties only.
+
+**Aggregate metrics:**
+
+| Metric | Baseline (argmax) | Notes |
+|--------|-------------------|-------|
+| Accuracy | 0.9430 | Misleading at 79% imbalance — see macro-F1 |
+| **Macro F1** | **0.7312** | Primary metric: equal weight across all 9 classes |
+| Weighted F1 | 0.9434 | Dominated by `none` class, less informative |
+| None recall | 0.9711 | Fraction of normal wafers correctly identified |
+| **False alarm rate** | **0.0289** | Fraction of true-normal wafers predicted as defective |
+| **Defect recall** | **0.9067** | Fraction of true-defect wafers predicted as defective |
+| Scratch precision | 0.3494 | |
+| Scratch recall | 0.5251 | |
+
+**Per-class recall (test split):**
+
+| Class | Recall | Support | Notes |
+|-------|--------|---------|-------|
+| none | 0.971 | 22,115 | Primary target |
+| Edge-Ring | 0.943 | 1,452 | Best-performing defect class |
+| Random | 0.885 | 130 | |
+| Donut | 0.831 | 83 | |
+| Center | 0.730 | 644 | |
+| Edge-Loc | 0.732 | 779 | |
+| Scratch | 0.525 | 179 | Challenging — linear pattern, rare |
+| **Loc** | **0.520** | 539 | **Challenging — diffuse cluster, high confusion** |
+| Near-full | ~1.0 | 22 | **Caution: support is very small (n=22); not reliable** |
+
+**Limitations:**
+- **Loc and Scratch** remain the weakest classes. Loc recall (~52%) reflects its visual similarity to Edge-Loc and Center. Scratch recall (~53%) reflects sparsity of the linear defect pattern relative to noisy backgrounds.
+- **Near-full** shows high recall but support is only ~22 test samples — this number is statistically unreliable and should not be over-interpreted.
+- This is a portfolio CNN baseline, not a production model. A real fab deployment would require lot-level train/test split, per-tool normalization, domain shift monitoring, and engineer-reviewed threshold selection.
+
+### Threshold Calibration and False Alarm Trade-off
+
+Post-training threshold calibration provides a second operating point tuned for **low false alarms**:
+
+```
+If max(defect class probability) < threshold → predict none (normal)
 ```
 
-Outputs: `outputs/models/wafer_cnn_best.pth`, `outputs/reports/wafer/training_metrics.json`,
-`outputs/reports/wafer/confusion_matrix_val.png`.
+Calibration sweep on the validation split; evaluation reported on the held-out test split:
 
-**Evaluate on held-out test split:**
+| Operating point | Threshold | None recall | False alarm rate | Defect recall | Macro F1 |
+|-----------------|-----------|-------------|-----------------|---------------|----------|
+| Baseline (argmax) | 0.0 | 0.9711 | 0.0289 | 0.9067 | 0.7312 |
+| **Low-false-alarm** | **0.9** | **0.9995** | **0.0005** | **0.4608** | **0.5629** |
 
-```bash
-python scripts/evaluate_wafer_cnn.py
-```
+**Interpretation:**
+- Threshold 0.9 is a **low-false-alarm operating point**, not the overall best model. It maximizes normal-wafer recall at the cost of significantly lower defect recall (0.91 → 0.46).
+- In a real fab context, false alarms on clean wafers incur unnecessary engineer investigation and potential tool downtime. Threshold selection is a business/engineering decision that depends on the relative cost of false alarms vs. missed defects.
+- The calibration demonstrates the trade-off exists and can be navigated — it does not make the model "better overall."
 
-Outputs: `outputs/reports/wafer/evaluation_metrics.json`, `confusion_matrix_test.png`,
-`misclassified.png`.
+### Dashboard Demo Note
 
-### Interactive Demo
+The dashboard supports two wafer map demo modes:
 
-A Streamlit web demo lets you visualise each defect class and run
-inference without WM-811K data (uses synthetic patterns when no
-checkpoint is available).
+| Mode | Source | Suitable for accuracy validation? |
+|------|--------|-----------------------------------|
+| **Real WM-811K test sample** | Actual held-out test samples from LSWMD.pkl | **Yes** — same distribution as evaluation |
+| Synthetic illustration | Hand-crafted geometric patterns (`demo_samples.py`) | **No** — out-of-distribution; for UI demonstration only |
 
-```bash
-# Launch the demo
-streamlit run src/semiconductor_yield/dashboard/wafer_demo.py
-# -- or --
-python scripts/run_wafer_demo.py
-```
+Synthetic illustration samples use simple geometric rules (e.g., a circular center cluster, a ring at the edge) that visually approximate WM-811K classes but differ from real wafer patterns. They may be misclassified. **Do not use synthetic illustration results to judge model accuracy.**
 
-The demo will:
-- Auto-detect whether a trained checkpoint exists
-  (`outputs/models/wafer_cnn_best.pth`)
-- Fall back to **demo mode** (randomly-initialised weights, clearly
-  labelled) if the checkpoint is missing — so the UI can be shown
-  without training first
-- Accept uploaded `.npy`, `.pkl`, or `.csv` wafer map files alongside
-  the built-in synthetic pattern generator
-
-> **Screenshot:** `docs/assets/wafer_demo_screenshot.png`
-> *(placeholder — run the demo and add a screenshot here)*
-
-### Results
-
-> Metrics on **WM-811K public dataset** only.
-> This is a portfolio project — numbers reflect dataset properties, not real fab deployment performance.
-
-| Split | Macro F1 | Notes |
-|-------|----------|-------|
-| Validation | TBD | Run `train_wafer_cnn.py` to populate |
-| Test | TBD | Run `evaluate_wafer_cnn.py` to populate |
-
-### Interview talking points
-
-| Topic | What to say |
-|-------|-------------|
-| **Why ~94K params, not ResNet?** | Lightweight baseline that runs on CPU with no pretrained weights. The goal is demonstrating the full pipeline (data → train → eval → demo), not achieving SOTA. |
-| **Why WeightedRandomSampler over focal loss?** | At 79% imbalance, the sampler re-balances the gradient signal itself rather than just scaling the loss — empirically more stable for extreme imbalance. |
-| **Why macro F1, not accuracy?** | A "predict none" classifier achieves 79% accuracy. Macro F1 gives equal weight to all 9 classes. |
-| **What's missing for real fab?** | Recipe drift detection, per-tool normalisation, domain shift monitoring, regulatory audit trail, false-alarm cost modelling. Documented in `docs/interview_notes.md`. |
-| **What does demo mode mean?** | If no checkpoint is present, the UI runs with random weights and clearly labels predictions as meaningless — so the layout and interaction can be demonstrated without needing to train first. |
+Model accuracy should be evaluated using the test-split metrics table above and the real WM-811K sample demo mode.
 
 ---
 
-## Module B: SPC + Process Anomaly Detection
-
-### Background
-
-Statistical Process Control (SPC) is a mandatory tool in semiconductor manufacturing, required
-by SEMI and ISO standards. Control charts monitor process parameters in real time; violations
-of control rules (Western Electric Rules) trigger engineer investigation.
-
-Modern fabs generate thousands of process parameters per tool per lot. SPC covers univariate
-monitoring well, but multivariate anomalies — where no single parameter violates its limits
-but the combination is abnormal — require ML-based detection.
-
-This module implements both layers: rule-based SPC and ML-based anomaly detection, with an
-ensemble combining their outputs.
+## Module B: SPC + ML Anomaly Detection + RCA
 
 ### Data
 
-Synthetic process data generated by `scripts/generate_synthetic_data.py`, simulating 8
-process parameters (etch rate, deposition thickness, chamber temperature, pressure, RF power,
-gas flow, bias voltage, substrate rotation) with controlled anomaly injection.
+Synthetic process data generated by `scripts/generate_synthetic_process_data.py`:
+- **5 process steps:** Lithography, Etching, Deposition, CMP, Metrology
+- **8 features:** temperature, pressure, gas_flow, rf_power, exposure_dose, film_thickness, overlay_error, defect_density
+- **50 lots, 6,250 rows total** (125 measurements per lot)
+- Controlled anomaly injection: sustained +6°C temperature drift (last 20% of lots), pressure spikes
 
-Optional: UCI SECOM dataset (1,567 samples, 590 features, real semiconductor process,
-binary pass/fail labels).
-
-### Approach
-
-| Component | Implementation | Rationale |
-|-----------|---------------|-----------|
-| SPC | 4 Western Electric Rules (Rules 1–4) | Interpretable, per-parameter, ISO 7870 compliant |
-| Anomaly detection | Isolation Forest (sklearn) | Multivariate, unsupervised, fast inference |
-| Anomaly detection | Autoencoder (PyTorch MLP) | Reconstruction-error-based; catches correlated shifts |
-| Ensemble | `any` / `all` voting | Tune recall vs precision trade-off for false-alarm cost |
-
-### SPC vs ML: Complementary Layers
-
-| Aspect | SPC (WE Rules) | ML (IF + Autoencoder) |
-|--------|---------------|----------------------|
-| Interpretability | High — exact rule and sigma zone named | Low-medium — anomaly score only |
-| Scope | Univariate, one parameter at a time | Multivariate, all features jointly |
-| Training data needed | No — statistical formulas | Yes — requires process-baseline data |
-| Detects subtle correlated shifts | No | Yes |
-| Regulatory / audit trail | Yes (ISO 7870, SEMI E10) | Requires additional documentation |
-
-In practice, SPC and ML run in parallel: SPC for univariate rule-based alerts and regulatory
-compliance; ML for multivariate anomaly patterns that no single parameter's chart would catch.
-A violation from either layer triggers engineer investigation — neither is a confirmed defect.
+This is simulated data that does not represent any real fab or tool.
 
 ### Feature Sets and Leakage Boundaries
 
-Two named feature sets are defined to make the model's information horizon explicit and prevent
-temporal leakage:
+| Feature set | Features | When available |
+|-------------|----------|----------------|
+| `process_only` | temperature, pressure, gas_flow, rf_power, exposure_dose | In-situ, during step execution |
+| `full` (default) | All 8 features (adds film_thickness, overlay_error, defect_density) | After offline inspection |
 
-| Feature set | CLI flag | Features | When available |
-|-------------|----------|----------|----------------|
-| `process_only` | `--feature-set process_only` | temperature, pressure, gas\_flow, rf\_power, exposure\_dose | During step execution (in-situ, real-time) |
-| `full` | `--feature-set full` (default) | all 8 features — adds film\_thickness, overlay\_error, defect\_density | After offline inspection (post-process only) |
+`yield_rate`, `anomaly_label`, `anomaly_type`, and `suspected_root_cause` are **never** used as model inputs. The models are trained fully unsupervised; ground-truth labels are used only to evaluate recall on the held-out test split.
 
-**`process_only`** avoids label, outcome, and metrology leakage entirely. All five features
-are reported by the process tool in real time during step execution — no post-process
-inspection result is included. This is the correct set for early detection: flagging issues
-while the lot is still on the tool, before any offline measurement is scheduled.
+### SPC Analysis
 
-**`full`** adds the three offline inspection results (film thickness from ellipsometer,
-overlay error from metrology tool, defect density from wafer inspection scanner). These are
-only available after the process step completes and the wafer is routed to an inspection
-station. Use this set exclusively for post-process quality monitoring or retrospective
-anomaly analysis — **not** for real-time or inline detection models.
+```powershell
+python scripts/run_spc_analysis.py
+```
 
-`yield_rate`, `anomaly_label`, `anomaly_type`, and `suspected_root_cause` are **never** used
-as model inputs. The ground-truth labels in the synthetic dataset are generated from
-controlled perturbations (e.g., step-specific temperature drift, pressure spikes) and are
-used **only** to evaluate detection recall on the held-out test split — training is fully
-unsupervised.
+**Approach:** Step-aware Western Electric Rules 1–4, applied per `(process_step, feature)` group. Rule 4 (8+ consecutive points same side of mean) fires once per qualifying run (deduplicated events) to avoid inflation from sustained drift.
 
-### Train / Validation / Test Split
+**Results on simulated data:**
 
-The dataset is partitioned by `lot_id` before any model fitting, so all wafers from a given
-lot stay in the same split. No wafer from a training lot appears in the test evaluation.
+| Metric | Value |
+|--------|-------|
+| Groups monitored | 26 (process step × feature) |
+| Raw violation count | 3,253 |
+| Deduplicated event count | 1,406 |
+| Violation rate | 52.1% of monitored groups |
 
-| Split | Lots | Rows | Purpose |
-|-------|------|------|---------|
-| Train | 35 (70%) | 4,375 | Unsupervised detector fitting |
-| Val | 7 (14%) | 875 | Available for threshold tuning (not used in current pipeline) |
-| Test | 8 (16%) | 1,000 | Held out; all reported metrics are on this split only |
+**Violations by rule:**
 
-The split is deterministic (seed = 42). Split metadata (which `lot_id`s belong to each split)
-is saved to `outputs/models/split_info.json` alongside trained models. The evaluate script
-reads this file to reconstruct the identical test set — it never touches training lots.
+| Rule | Count | Description |
+|------|-------|-------------|
+| Rule 4 (sustained run) | 2,097 | 8+ consecutive points same side of mean — sensitive to sustained drift |
+| Rule 3 (2-of-3 near limit) | 679 | 2 of 3 consecutive points in 2σ zone |
+| Rule 2 (run of 4+) | 293 | 4+ consecutive points on one side |
+| Rule 1 (beyond 3σ) | 184 | Single point beyond ±3σ — HIGH severity |
 
-### Results (simulated data — held-out test split, not real fab performance)
+**Top violating groups (simulated drift):**
 
-> All metrics are on the held-out **test split** (8 lots, 1,000 rows, anomaly rate ≈ 21.8%).
-> Detectors were trained only on the 35-lot training split; test lots were never seen during fitting.
-> These numbers validate pipeline correctness, not real-world detection capability.
+| Group | Violation count | Event count |
+|-------|-----------------|-------------|
+| Lithography\_\_temperature | 1,178 | 331 |
+| Metrology\_\_temperature | 707 | 311 |
+| Etching\_\_rf\_power | ~200+ | — |
 
-| Model | Precision | Recall | F1 | False Alarm Rate | ROC-AUC |
-|-------|-----------|--------|----|-----------------|---------|
-| Isolation Forest | 0.56 | 0.15 | 0.24 | 0.033 | 0.74 |
-| Autoencoder | 0.42 | 0.17 | 0.24 | 0.063 | 0.65 |
-| Ensemble (any) | 0.46 | 0.24 | 0.32 | 0.081 | 0.74 |
-| Ensemble (all) | 0.57 | 0.07 | 0.13 | 0.015 | 0.74 |
+The high Rule 4 count on temperature features reflects the injected +6°C sustained drift. In a real fab, sustained drift of this magnitude would be immediately visible and actioned — the simulation demonstrates that Rule 4 is correctly detecting the drift, but with elevated counts due to the extreme magnitude of the injected anomaly.
 
-The moderate recall reflects that the synthetic anomalies include subtle slow drifts (last 20%
-of lots, +6 °C temperature) which both models partially miss — a realistic challenge in fabs.
-Full evaluation report: `outputs/reports/process/anomaly_summary.json`.
+**SPC signals are process control warnings, not confirmed root causes.** Each violation flag requires engineer investigation of recipe history, tool maintenance logs, and consumable records before any root cause can be established.
 
-### Real-World Considerations
+Outputs: `outputs/reports/process/spc_violations.csv`, `spc_summary.json`, `spc_events.csv`, 26 control chart PNGs in `outputs/reports/process/charts/`.
 
-The following topics are not implemented in this portfolio project but are documented in
-`docs/interview_notes.md` as design considerations for real fab deployment:
+### ML Anomaly Detection
 
-- **Recipe drift:** Adaptive control limits via rolling-window baseline recalculation; CUSUM
-  charts for gradual drift detection; input-feature drift monitoring (PSI, KS test).
-- **Tool-to-tool variation:** Per-tool normalization; mixed-effects models to separate
-  tool offset from true process variation; fleet-level aggregation.
-- **Domain shift:** Data drift detection triggers for retraining; domain adaptation for
-  new product lines.
-- **False alarm cost:** In fab, a false alarm stops a tool (significant cost). The ensemble
-  `all` strategy maximizes precision; threshold tuning is guided by false-alarm cost models.
-- **Model monitoring:** Reconstruction error distribution tracking for Autoencoder degradation;
-  periodic backtesting of SPC rules against labeled fault events.
+```powershell
+# Train detectors (unsupervised — no labels used)
+python scripts/train_process_anomaly.py
+
+# Evaluate on held-out test split
+python scripts/evaluate_process_anomaly.py
+```
+
+**Models:** Isolation Forest (scikit-learn) + Autoencoder (PyTorch MLP, reconstruction error). Ensemble voting: `any` (either model flags) or `all` (both models flag).
+
+**Train/test split:** Partitioned by `lot_id` — all wafers from a given lot stay in the same split. No training lot appears in the test evaluation.
+
+| Split | Lots | Rows |
+|-------|------|------|
+| Train | 35 (70%) | 4,375 |
+| Val | 7 (14%) | 875 |
+| Test | 8 (16%) | 1,000 |
+
+**Results on held-out test split** (anomaly rate ≈ 21.8%, simulated data):
+
+| Model | Precision | Recall | F1 | ROC-AUC | False Alarm Rate |
+|-------|-----------|--------|----|---------|-----------------|
+| Isolation Forest | 0.559 | 0.151 | 0.238 | 0.736 | 0.033 |
+| Autoencoder | 0.423 | 0.101 | 0.163 | 0.682 | 0.038 |
+| Ensemble (any) | 0.472 | 0.193 | 0.274 | 0.736 | 0.060 |
+| Ensemble (all) | 0.591 | 0.060 | 0.108 | 0.736 | 0.012 |
+
+**Trade-off:**
+- Ensemble `any` improves recall (more anomalies caught) at the cost of a higher false alarm rate.
+- Ensemble `all` lowers false alarm rate but misses more anomalies.
+- The moderate recall reflects that the injected anomalies include subtle slow drift (+6°C over the last 20% of lots), which both models partially miss — a realistic challenge representative of gradual process degradation in real fabs.
+
+Outputs: `outputs/reports/process/anomaly_scores.csv`, `anomaly_summary.json`, `feature_importance.csv`.
+
+### RCA-style Candidate Analysis
+
+```powershell
+python scripts/run_process_rca.py
+```
+
+The RCA module combines SPC violation signals and anomaly detector scores to rank **suspected process steps** as investigation candidates. Each candidate includes:
+
+- Suspected process step
+- Suspicious features (ranked by SPC + anomaly signal synergy)
+- Evidence bullets (e.g., "Rule 4 sustained drift in Lithography temperature")
+- Recommended engineer checks (recipe history, tool logs, consumable records)
+- Confidence level (high / medium / low)
+- Limitation note (explicitly states what cannot be concluded without engineer review)
+
+**All outputs use "suspected", "candidate", and "recommended check" language deliberately.**  
+This module does NOT diagnose or confirm root causes. Confirming a root cause in a real fab requires access to recipe files, FDC logs, tool maintenance records, metrology raw data, and process engineer judgment — none of which are available here.
+
+Output: `outputs/reports/process/rca_report.md`.
 
 ---
 
-## Getting Started
+## Integrated Dashboard
+
+```powershell
+streamlit run src/semiconductor_yield/dashboard/app.py
+# -- or --
+python scripts/run_dashboard.py
+```
+
+The unified Streamlit dashboard covers all modules in one interface:
+
+| Page | Content |
+|------|---------|
+| **Home** | Project overview, data disclosure, module summary, demo walkthrough guide |
+| **Wafer Map Classification** | CNN v2 model performance panel (metrics + calibration trade-off); live inference demo with real WM-811K test samples or synthetic illustration |
+| **Process SPC** | Step/feature selector; control chart PNG; violation summary table (by step × rule); severity filter |
+| **Anomaly Detection** | Score trend (IF + AE); model performance table; anomaly rate by step; flagged sample table |
+| **RCA Analysis** | Ranked candidate table; per-candidate evidence and recommended checks; explicit limitation notes |
+| **Real Fab Considerations** | Engineering gaps between this portfolio demo and a production-grade system |
+
+The dashboard is a **demo system only** — not a production tool. It auto-detects available data and falls back gracefully:
+
+| Page | Falls back to if data missing |
+|------|-------------------------------|
+| Wafer Map Classification | Demo mode with random weights (clearly labelled) |
+| Process SPC | Warning message + `python scripts/run_spc_analysis.py` instruction |
+| Anomaly Detection | Warning message + run instructions |
+| RCA Analysis | Warning message + `python scripts/generate_synthetic_process_data.py` instruction |
+
+**Recommended interview demo sequence:**
+1. **Home** — establish data context and disclaimer upfront
+2. **Wafer Map Classification** → Real WM-811K test sample → observe prediction + true label comparison
+3. **Process SPC** → select `Lithography | temperature` → inspect sustained drift (Rule 4) and violation table
+4. **Anomaly Detection** → score trend, ensemble comparison, flagged sample table
+5. **RCA Analysis** → top candidate with evidence bullets and recommended checks
+6. **Real Fab Considerations** → proactively surface deployment gaps
+
+---
+
+## Quickstart
 
 ### Prerequisites
 
 - Python 3.11+
-- (Optional) CUDA-compatible GPU for faster CNN training
+- Optional: CUDA GPU for faster CNN training (CPU-runnable, ~30 min on CPU for full 30 epochs)
 
 ### 1. Create virtual environment
 
-```bash
-# Windows (PowerShell)
+```powershell
+# Windows PowerShell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 
@@ -333,129 +403,226 @@ source .venv/bin/activate
 
 ### 2. Install dependencies
 
-```bash
+```powershell
 pip install -e ".[dev]"
-# or
+# -- or using Make --
 make install-dev
 ```
 
-### 3. Download / prepare data
+### 3. Download WM-811K (Module A only)
 
-**WM-811K (required for Module A):**
-1. Go to https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map
-2. Download `LSWMD.pkl` (~350 MB)
-3. Place at `data/raw/wm811k/LSWMD.pkl`
-
-**UCI SECOM (optional for Module B):**
-```bash
-python scripts/download_data.py --dataset secom
+```
+1. Visit: https://www.kaggle.com/datasets/qingyi/wm811k-wafer-map
+2. Download LSWMD.pkl (~350 MB)
+3. Place at: data/raw/wm811k/LSWMD.pkl
 ```
 
-**Synthetic SPC data (Module B, auto-generated):**
-```bash
-python scripts/generate_synthetic_data.py
-# or
-make generate-data
+All Module A scripts check for this file and print clear instructions if it is missing — no cryptic tracebacks.
+
+### 4. Generate synthetic process data (Module B)
+
+```powershell
+python scripts/generate_synthetic_process_data.py
 ```
 
-### 4. Run EDA (Module A)
+Output: `data/synthetic/process_data.csv`
 
-```bash
-# Full EDA — requires data/raw/wm811k/LSWMD.pkl
-python scripts/run_wafer_eda.py
+### 5. Run Wafer EDA
 
-# Fast smoke run (5 000 samples)
-python scripts/run_wafer_eda.py --max-samples 5000
+```powershell
+python scripts/run_wafer_eda.py           # full (requires LSWMD.pkl)
+python scripts/run_wafer_eda.py --max-samples 5000   # fast smoke run
 ```
 
-Outputs land in `outputs/reports/wafer/`. If the pkl file is missing, the script
-prints clear download instructions and exits — no cryptic traceback.
+### 6. Train Wafer CNN v2
 
-### 5. Run tests
+```powershell
+# Hybrid sampling v2 — recommended
+python scripts/train_wafer_cnn.py --sampling-mode hybrid --epochs 30
 
-```bash
-pytest tests/
-# or
-make test
+# Small CPU-friendly smoke run
+python scripts/train_wafer_cnn.py `
+    --sampling-mode hybrid `
+    --none-samples 1000 --major-class-samples 500 `
+    --minor-class-samples 300 --rare-class-samples 200 `
+    --epochs 5
+
+# Record the run_id printed at end of training
 ```
 
-### 6. Train Module A (wafer map classifier)
+### 7. Evaluate Wafer CNN (test split + calibration)
 
-```bash
-# Requires data/raw/wm811k/LSWMD.pkl — see step 3 above
-python scripts/train_wafer_cnn.py
-
-# Quick smoke run (5 000 samples, 5 epochs)
-python scripts/train_wafer_cnn.py --max-samples 5000 --epochs 5
-```
-
-### 6b. Evaluate Module A (test split)
-
-```bash
+```powershell
 python scripts/evaluate_wafer_cnn.py
+# -- or with explicit run_id --
+python scripts/evaluate_wafer_cnn.py --run-id run_YYYYMMDD_HHMMSS
 ```
 
-### 7. Run Module B — SPC analysis
+### 8. Compare runs
 
-```bash
+```powershell
+python scripts/compare_wafer_runs.py `
+    --baseline-run-id run_YYYYMMDD_HHMMSS `
+    --candidate-run-id run_YYYYMMDD_HHMMSS
+```
+
+### 9. Run SPC analysis
+
+```powershell
 python scripts/run_spc_analysis.py
 ```
 
-Outputs: `outputs/reports/process/spc_violations.csv` + 26 control chart PNGs.
+### 10. Train and evaluate anomaly detection
 
-### 8. Run Module B — ML anomaly detection
-
-```bash
-# Train Isolation Forest + Autoencoder (unsupervised, no labels used)
+```powershell
 python scripts/train_process_anomaly.py
-
-# Evaluate against ground-truth labels and save reports
 python scripts/evaluate_process_anomaly.py
 ```
 
-Outputs: `outputs/reports/process/anomaly_scores.csv`, `anomaly_summary.json`,
-`feature_importance.csv`.
+### 11. Run RCA candidate analysis
 
-### 9. Run Module B full pipeline (legacy)
-
-```bash
-python scripts/run_module_b_pipeline.py --stage full
-# or
-make run-spc
+```powershell
+python scripts/run_process_rca.py
 ```
 
-### 10. Launch the unified dashboard
+### 12. Launch dashboard
 
-```bash
-# Recommended — launches the full unified dashboard
+```powershell
 streamlit run src/semiconductor_yield/dashboard/app.py
 # -- or --
 python scripts/run_dashboard.py
-
-# Standalone wafer map demo only (no process data required)
-streamlit run src/semiconductor_yield/dashboard/wafer_demo.py
-python scripts/run_wafer_demo.py
 ```
 
-The dashboard auto-detects available data and falls back to demo mode gracefully:
+### 13. Validate dashboard inference pipeline
 
-| Page | Requires | Falls back to |
-|------|----------|---------------|
-| Wafer Map Classification | `outputs/models/wafer_cnn_best.pth` | Random-weight demo mode |
-| Process SPC | `outputs/reports/process/spc_violations.csv` | Warning + run command |
-| Anomaly Detection | `outputs/reports/process/anomaly_scores.csv` | Warning + run command |
-| RCA Analysis | `data/synthetic/process_data.csv` | Warning + run command |
+```powershell
+# Requires LSWMD.pkl; samples 20 real test wafers per class
+python scripts/validate_wafer_dashboard_inference.py
+```
 
-**Interview demo sequence (recommended):**
-1. **Home** — data context and disclaimer
-2. **Wafer Map Classification** — generate Center or Edge-Ring demo sample, observe prediction
-3. **Process SPC** — select `Etching | temperature`, inspect control chart and violation table
-4. **Anomaly Detection** — score trend, per-step anomaly rate, flagged sample table
-5. **RCA Analysis** — top candidate with evidence bullets and recommended checks
-6. **Real Fab Considerations** — proactively surface deployment gaps (shows manufacturing awareness)
+### 14. Run tests
 
-> **Screenshot placeholder:** `docs/assets/dashboard_screenshot.png`
-> *(run the dashboard and add a screenshot here)*
+```powershell
+pytest tests/
+make test
+# With coverage
+make test-cov
+```
+
+---
+
+## Repository Structure
+
+```
+semiconductor-yield-analytics/
+├── src/semiconductor_yield/          # Core Python package
+│   ├── config.py                     # Central paths and constants
+│   ├── models/
+│   │   └── wafer_cnn.py              # WaferCNN architecture (~94K params)
+│   ├── wafer/
+│   │   ├── data_loader.py            # WM-811K LSWMD.pkl parser
+│   │   ├── dataset.py                # WaferMapDataset + hybrid/balanced sampling
+│   │   ├── preprocess.py             # Resize, normalize, stratified split
+│   │   ├── train.py                  # fit() — training loop with sampling modes
+│   │   ├── evaluate.py               # evaluate_model(), calibration sweep
+│   │   ├── inference.py              # WaferInference — single-sample prediction
+│   │   ├── demo_samples.py           # Synthetic illustration pattern generators
+│   │   └── eda.py                    # EDA report generation
+│   ├── process/
+│   │   ├── synthetic.py              # Synthetic process data generator
+│   │   ├── spc.py                    # Western Electric Rules 1–4
+│   │   ├── features.py               # Feature set definitions (process_only / full)
+│   │   ├── anomaly.py                # Isolation Forest + Autoencoder wrapper
+│   │   ├── rca.py                    # RCA-style candidate analysis
+│   │   ├── visualization.py          # SPC control chart plotting
+│   │   └── report.py                 # Report serialization
+│   └── dashboard/
+│       ├── app.py                    # Unified Streamlit dashboard
+│       ├── wafer_demo.py             # Standalone wafer demo
+│       └── data_helpers.py           # Dashboard data loaders
+│
+├── scripts/                          # CLI entry points
+│   ├── train_wafer_cnn.py            # Train WaferCNN (hybrid / balanced / weighted)
+│   ├── evaluate_wafer_cnn.py         # Test-split evaluation + calibration
+│   ├── compare_wafer_runs.py         # Compare two run evaluation_metrics.json
+│   ├── run_wafer_eda.py              # WM-811K EDA
+│   ├── generate_synthetic_process_data.py  # Generate simulated process data
+│   ├── run_spc_analysis.py           # SPC analysis + charts
+│   ├── train_process_anomaly.py      # Train IF + Autoencoder
+│   ├── evaluate_process_anomaly.py   # Evaluate anomaly detection
+│   ├── run_process_rca.py            # RCA candidate analysis
+│   ├── validate_wafer_dashboard_inference.py  # Dashboard inference validation
+│   ├── run_dashboard.py              # Launch unified dashboard
+│   └── run_wafer_demo.py             # Launch standalone wafer demo
+│
+├── tests/                            # pytest test suite (121+ tests)
+│   ├── test_wafer_cnn.py             # WaferCNN, training, hybrid sampling, calibration
+│   ├── test_spc.py                   # Western Electric Rules 1–4
+│   ├── test_anomaly.py               # Isolation Forest + Autoencoder
+│   ├── test_rca.py                   # RCA candidate analysis
+│   ├── test_wafer_inference.py       # Inference pipeline
+│   ├── test_wafer_preprocess.py      # Preprocessing utilities
+│   ├── test_wafer_eda.py             # EDA functions
+│   ├── test_dashboard.py             # Dashboard data helpers
+│   ├── test_synthetic_data.py        # Synthetic data generator
+│   ├── test_data_paths.py            # Path configuration
+│   └── test_smoke.py                 # End-to-end smoke tests
+│
+├── configs/
+│   ├── module_a.yaml                 # WaferCNN hyperparameter config
+│   └── module_b.yaml                 # Process anomaly detection config
+│
+├── docs/
+│   ├── data_contract.md              # Feature definitions, leakage boundaries
+│   ├── interview_notes.md            # Domain rationale, design decisions, talking points
+│   └── level2_consolidation_report.md  # v2 consolidation audit
+│
+├── outputs/
+│   ├── models/
+│   │   ├── wafer_cnn_best.pth        # Latest trained checkpoint (overwritten on retrain)
+│   │   ├── wafer_cnn_v2_hybrid_best.pth  # Stable v2 checkpoint copy
+│   │   ├── isolation_forest.joblib
+│   │   ├── autoencoder.joblib
+│   │   └── split_info.json
+│   └── reports/
+│       ├── wafer/
+│       │   ├── active_run.json       # Active run pointer (v2 metrics)
+│       │   └── runs/                 # Per-run evaluation directories
+│       └── process/
+│           ├── spc_violations.csv
+│           ├── spc_summary.json
+│           ├── spc_events.csv
+│           ├── anomaly_scores.csv
+│           ├── anomaly_summary.json
+│           ├── rca_report.md
+│           └── charts/               # 26 SPC control chart PNGs
+│
+├── data/
+│   ├── raw/wm811k/                   # Place LSWMD.pkl here (not included)
+│   └── synthetic/process_data.csv    # Generated synthetic data
+│
+├── pyproject.toml                    # Dependencies and project metadata
+├── Makefile                          # install, test, lint, generate-data, dashboard
+└── Dockerfile                        # CPU-only container, exposes port 8501
+```
+
+---
+
+## Testing
+
+```powershell
+# Run all tests
+pytest tests/
+
+# With coverage report
+pytest tests/ --cov=src/semiconductor_yield --cov-report=html
+
+# Using Make
+make test
+make test-cov
+```
+
+All tests use synthetic data and do not require WM-811K or a trained checkpoint.
 
 ---
 
@@ -465,41 +632,92 @@ The dashboard auto-detects available data and falls back to demo mode gracefully
 # Build
 docker build -t semiconductor-yield-analytics .
 
-# Run dashboard
+# Run dashboard (CPU only)
 docker run -p 8501:8501 semiconductor-yield-analytics
 ```
 
 ---
 
-## Testing
+## Real Fab Deployment Considerations
 
-```bash
-# Run all tests
-pytest tests/
+The following gaps between this portfolio project and a production-grade system are documented intentionally — raising them proactively in an interview demonstrates manufacturing domain awareness.
 
-# With coverage report
-pytest tests/ --cov=src/semiconductor_yield --cov-report=html
-make test-cov
-```
-
-Coverage targets: ≥90% on SPC/rules logic, ≥80% on preprocessing, ≥70% overall.
+| Gap | What would be needed in production |
+|-----|-------------------------------------|
+| **Recipe drift** | Rolling-window SPC baseline recalculation as process conditions evolve; CUSUM charts for gradual drift; PSI/KS-test for input feature drift to trigger retraining |
+| **Tool-to-tool variation** | Per-tool normalization before SPC and ML scoring; mixed-effects models separating tool offset from true process variation; fleet-level aggregation dashboards |
+| **Class imbalance** | Cost-sensitive threshold calibration per class; missing Edge-Ring (systematic equipment issue) is typically far more expensive than a false Loc alarm — this project demonstrates the trade-off but does not implement cost-weighted selection |
+| **Domain shift** | Confidence thresholding to route low-confidence predictions to human review; periodic re-validation against labeled fault events; domain adaptation for new product introductions |
+| **False alarm cost** | In a real fab, triggering a false anomaly alarm can initiate a tool hold costing $5k–$10k/hour. Threshold selection is an engineering decision with explicit cost modeling — not a data science optimization |
+| **Threshold calibration** | This project demonstrates the calibration sweep; real fab deployment requires cost-aware operating point selection reviewed by process engineers, not automated selection |
+| **Model monitoring** | Reconstruction error distribution tracking for Autoencoder degradation; periodic backtesting of SPC control limits; confidence score distribution monitoring for CNN drift |
+| **Human-in-the-loop review** | ML models in safety-relevant manufacturing cannot operate autonomously under ISO/SEMI standards. Every flagged event requires engineer review; tool holds require credentialed process engineer sign-off |
+| **Process engineer review before action** | All RCA candidate outputs from this project are explicitly labeled as starting points for investigation, not action items. Real RCA requires FDC log access, recipe history, and engineer judgment |
 
 ---
 
-## Limitations & Future Work
+## What This Project Demonstrates
 
-**Current limitations:**
-- All results are on public / simulated data — not validated in a real fab environment.
-- CNN training does not stratify by lot ID (ideal split would be lot-level to prevent data leakage).
-- SECOM dataset has only 1,567 samples; too small for deep learning, used as pipeline demo only.
-- Autoencoder threshold is set on training data; in production, continuous recalibration is needed.
+| Skill area | Evidence in this project |
+|------------|--------------------------|
+| **Semiconductor domain understanding** | Correct use of yield analysis concepts, SPC rules (ISO 7870 / SEMI E10), wafer map defect taxonomy, false alarm cost reasoning, RCA workflow constraints |
+| **Python data pipeline** | End-to-end pipeline from raw .pkl → EDA → training → evaluation → dashboard; reproducible splits; run versioning |
+| **ML baseline evaluation** | Multiple metrics (macro-F1, per-class recall, false alarm rate, defect recall); no misleading accuracy-only reporting; honest limitation documentation |
+| **Class imbalance handling** | Hybrid class-group-aware sampling + weighted sampler; rationale documented |
+| **False alarm cost awareness** | Threshold calibration with explicit trade-off table; low-false-alarm operating point distinguished from overall best model |
+| **SPC and manufacturing analytics** | Western Electric Rules 1–4; step-aware grouping; raw violations vs. deduplicated events; severity classification |
+| **Anomaly detection without target leakage** | Lot-level grouped split; unsupervised training; `process_only` vs `full` feature set distinction documented |
+| **RCA-style reasoning with safety limits** | Candidate analysis language; explicit limitation notes; distinction between SPC warning and confirmed root cause |
+| **Dashboard and visualization** | Streamlit multi-page app; real vs. synthetic demo distinction; graceful fallback on missing data |
+| **Test-driven development** | 121+ tests covering training, evaluation, SPC rules, anomaly detection, inference, preprocessing |
+| **Honest limitation awareness** | Near-full support caveat; OOD synthetic demo warning; portfolio baseline classification; no production claims |
 
-**Future extensions:**
-- Lot-stratified train/val/test split for Module A
-- CUSUM chart implementation for Module B
-- Per-tool normalization and multi-tool comparison view
+---
+
+## Limitations
+
+- All Module A results are on the **public WM-811K dataset** — not validated on real fab wafer maps.
+- All Module B results are on **synthetically generated process data** — not validated on real tool data.
+- **CNN v2 is a portfolio baseline.** Loc recall (~52%) and Scratch recall (~53%) remain challenging. Near-full recall is unreliable due to small test support (n≈22).
+- **Hybrid sampling** reduces false alarms vs. v1 but does not eliminate the Loc/Scratch difficulty.
+- **Threshold 0.9** is a low-false-alarm operating point — it trades defect recall (0.91 → 0.46) for near-zero false alarm rate (0.029 → 0.001). It is not the overall best model.
+- **Synthetic illustration patterns** in the dashboard demo are out-of-distribution relative to real WM-811K wafer maps and should not be used to evaluate model accuracy.
+- **Anomaly detection recall is limited** (IF: 0.151, AE: 0.101) on the simulated test split, especially for subtle slow-drift anomalies.
+- **RCA outputs are candidate analysis only** — not confirmed diagnoses. They cannot be acted upon without process engineer review of real fab data.
+- No real-time inference pipeline, no lot-level stratified split for Module A, no CUSUM chart, no per-tool normalization.
+- This project is not production-ready.
+
+---
+
+## Future Work
+
+- Stronger CNN backbone (ResNet-18 or SE-ResNet) with transfer learning from ImageNet
+- Focal loss / mixup augmentation for Loc and Scratch improvement
+- Lot-level stratified train/test split for Module A (currently sample-level)
+- Cost-sensitive evaluation: explicit false-alarm-vs-missed-defect cost matrix
+- CUSUM chart for gradual drift detection (Module B)
+- SECOM dataset support for real semiconductor process features
+- Per-tool normalization and multi-tool comparison view (Module B)
+- Operating point selection with explicit cost model
+- Model monitoring: confidence score drift, reconstruction error distribution tracking
 - REST API wrapper for model inference (FastAPI)
-- CI/CD pipeline with GitHub Actions
+- CI/CD pipeline with GitHub Actions test automation
+
+---
+
+## Resume Bullets
+
+### Short English
+
+> Built a semiconductor yield analytics portfolio project in Python integrating WaferCNN defect classification (WM-811K, macro-F1 0.73, false alarm rate 2.9%), SPC with Western Electric Rules, Isolation Forest + Autoencoder anomaly detection, and RCA-style candidate analysis — with a Streamlit dashboard and 121-test suite.
+
+### Medium English
+
+> Developed a two-module semiconductor analytics platform: (A) WaferCNN v2 trained on the public WM-811K dataset using hybrid class-group-aware sampling, achieving macro-F1 0.73 / none recall 97.1% / false alarm rate 2.9% on the held-out test split, with false-alarm-aware threshold calibration demonstrating the detection trade-off; (B) step-aware SPC (Western Electric Rules 1–4), unsupervised anomaly detection (Isolation Forest + Autoencoder, lot-grouped split, no target leakage, IF ROC-AUC 0.74), and RCA-style candidate analysis with explicit limitation documentation — integrated in a Streamlit dashboard with graceful fallback and a 121-test pytest suite.
+
+### Japanese（職務経歴書向け）
+
+> Python を用いた半導体 Yield 解析ポートフォリオを開発。**Module A**：公開データセット WM-811K を使用し、クラス不均衡対策としてハイブリッドサンプリングを実装した CNN（WaferCNN v2）を構築。テストデータにて Macro-F1 0.73・False Alarm Rate 2.9% を達成。閾値キャリブレーションにより False Alarm と Defect Recall のトレードオフを可視化。**Module B**：シミュレーション工程データに対し、Western Electric Rules（4 ルール）によるステップ別 SPC、Isolation Forest＋Autoencoder によるアンサンブル異常検知（ロットグループ分割、目的変数リーク排除）、RCA 候補分析（調査対象ステップ・推奨確認項目の出力、確定的 RCA ではないことを明示）を実装。Streamlit ダッシュボードに統合し、pytest で 121 件以上のテストを整備。すべての結果は公開データ・シミュレーションデータによるものであり、実際の fab 生産性能ではありません。
 
 ---
 
@@ -507,19 +725,23 @@ Coverage targets: ≥90% on SPC/rules logic, ≥80% on preprocessing, ≥70% ove
 
 | Category | Library | Version |
 |----------|---------|---------|
-| Core ML | PyTorch | ≥2.2 |
-| Classical ML | scikit-learn | ≥1.4 |
-| Data | pandas, numpy | ≥2.1, ≥1.26 |
-| Visualization | plotly, matplotlib | ≥5.20, ≥3.8 |
-| Web UI | Streamlit | ≥1.35 |
-| Testing | pytest, pytest-cov | ≥7.4, ≥4.1 |
-| Packaging | setuptools, pyproject.toml | ≥68 |
-| Containers | Docker | — |
+| Core ML | PyTorch | ≥ 2.2 |
+| Classical ML | scikit-learn | ≥ 1.4 |
+| Data | pandas, numpy | ≥ 2.1, ≥ 1.26 |
+| Image processing | Pillow | ≥ 10.0 |
+| Visualization | matplotlib, plotly | ≥ 3.8, ≥ 5.20 |
+| Web UI | Streamlit | ≥ 1.35 |
+| Logging | loguru | ≥ 0.7 |
+| Testing | pytest, pytest-cov | ≥ 7.4, ≥ 4.1 |
+| Packaging | pyproject.toml | — |
+| Container | Docker | — |
 
 ---
 
 ## License
 
-MIT License. Dataset licenses:
-- WM-811K: see original MiraCle research publication for terms
-- UCI SECOM: UCI ML Repository terms of use
+MIT License.
+
+**Dataset licenses:**
+- WM-811K: see the original MiraCle research publication for terms of use. This repository does not include or redistribute the dataset.
+- Synthetic process data: generated by this project, no external license applies.
