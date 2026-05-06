@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from semiconductor_yield.models.wafer_cnn import WaferCNN
 from semiconductor_yield.wafer.data_loader import WaferSample
-from semiconductor_yield.wafer.dataset import WaferMapDataset, make_weighted_sampler
+from semiconductor_yield.wafer.dataset import WaferMapDataset, make_balanced_subset, make_weighted_sampler
 from semiconductor_yield.wafer.train import fit, train_epoch, validate_epoch
 
 
@@ -124,6 +124,70 @@ class TestWaferDataset:
         ds = _make_dataset(n_per_class=3)
         sampler = make_weighted_sampler(ds)
         assert sampler.replacement is True
+
+    def test_weighted_sampler_sqrt_inverse_mode(self):
+        ds = _make_dataset(n_per_class=3)
+        sampler = make_weighted_sampler(ds, mode="sqrt_inverse")
+        assert sampler.num_samples == len(ds)
+
+    def test_weighted_sampler_inverse_mode(self):
+        ds = _make_dataset(n_per_class=3)
+        sampler = make_weighted_sampler(ds, mode="inverse")
+        assert sampler.num_samples == len(ds)
+
+    def test_weighted_sampler_sqrt_weights_less_extreme(self):
+        """sqrt_inverse weights should be less extreme than inverse weights."""
+        import torch
+        ds = _make_dataset(n_per_class=3)
+        s_inv  = make_weighted_sampler(ds, mode="inverse")
+        s_sqrt = make_weighted_sampler(ds, mode="sqrt_inverse")
+        ratio_inv  = float(s_inv.weights.max()  / s_inv.weights.min())
+        ratio_sqrt = float(s_sqrt.weights.max() / s_sqrt.weights.min())
+        assert ratio_sqrt <= ratio_inv, "sqrt_inverse should be less extreme than inverse"
+
+    def test_weighted_sampler_invalid_mode(self):
+        ds = _make_dataset(n_per_class=3)
+        with pytest.raises(ValueError, match="Unknown mode"):
+            make_weighted_sampler(ds, mode="bad_mode")
+
+    def test_make_balanced_subset_cap(self):
+        """Each class should have at most samples_per_class items."""
+        samples = _make_dataset(n_per_class=10).samples
+        subset = make_balanced_subset(samples, samples_per_class=5, seed=0)
+        from collections import Counter
+        counts = Counter(s.label for s in subset)
+        assert all(v <= 5 for v in counts.values())
+
+    def test_make_balanced_subset_small_class(self):
+        """Classes with fewer samples than the cap keep all their samples."""
+        samples = _make_dataset(n_per_class=2).samples
+        subset = make_balanced_subset(samples, samples_per_class=100, seed=0)
+        assert len(subset) == len(samples)
+
+    def test_make_balanced_subset_reproducible(self):
+        samples = _make_dataset(n_per_class=10).samples
+        s1 = [s.label for s in make_balanced_subset(samples, 5, seed=7)]
+        s2 = [s.label for s in make_balanced_subset(samples, 5, seed=7)]
+        assert s1 == s2
+
+    def test_fit_balanced_subset(self, tmp_path):
+        """balanced_subset=True path should complete without error."""
+        train_ds = _make_dataset(n_per_class=10)
+        val_ds   = _make_dataset(n_per_class=2)
+        result = fit(
+            train_ds, val_ds,
+            epochs=1,
+            batch_size=8,
+            lr=1e-3,
+            balanced_subset=True,
+            samples_per_class=5,
+            device_str="cpu",
+            output_dir=tmp_path,
+            report_dir=tmp_path,
+            run_id="test_balanced",
+        )
+        assert (tmp_path / "wafer_cnn_best.pth").exists()
+        assert result["run_id"] == "test_balanced"
 
 
 # ── TestWaferCNN ──────────────────────────────────────────────────────────────
@@ -261,6 +325,7 @@ class TestTrainingSmoke:
             device_str="cpu",
             output_dir=tmp_path,
             report_dir=tmp_path,
+            run_id="test_run",
         )
         assert (tmp_path / "wafer_cnn_best.pth").exists(), "Checkpoint not saved"
 
@@ -276,13 +341,15 @@ class TestTrainingSmoke:
             device_str="cpu",
             output_dir=tmp_path,
             report_dir=tmp_path,
+            run_id="test_run",
         )
-        metrics_path = tmp_path / "training_metrics.json"
+        metrics_path = tmp_path / "runs" / "test_run" / "training_metrics.json"
         assert metrics_path.exists(), "training_metrics.json not saved"
         with open(metrics_path) as f:
             m = json.load(f)
-        for key in ("best_epoch", "best_val_macro_f1", "disclaimer", "history"):
+        for key in ("run_id", "best_epoch", "best_val_macro_f1", "disclaimer", "history"):
             assert key in m, f"Missing key in metrics: {key}"
+        assert m["run_id"] == "test_run"
 
     def test_fit_returns_metrics_dict(self, tmp_path):
         train_ds = _make_dataset(n_per_class=3)
@@ -296,7 +363,9 @@ class TestTrainingSmoke:
             device_str="cpu",
             output_dir=tmp_path,
             report_dir=tmp_path,
+            run_id="test_run",
         )
+        assert result["run_id"] == "test_run"
         assert result["best_epoch"] in (1, 2)
         assert 0.0 <= result["best_val_macro_f1"] <= 1.0
         assert len(result["history"]["train"]) == 2
@@ -315,5 +384,6 @@ class TestTrainingSmoke:
             device_str="cpu",
             output_dir=tmp_path,
             report_dir=tmp_path,
+            run_id="test_run",
         )
         assert (tmp_path / "wafer_cnn_best.pth").exists()

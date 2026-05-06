@@ -3,24 +3,30 @@
 Usage:
     python scripts/evaluate_wafer_cnn.py
     python scripts/evaluate_wafer_cnn.py --checkpoint outputs/models/wafer_cnn_best.pth
+    python scripts/evaluate_wafer_cnn.py --run-id run_20240101_120000
     python scripts/evaluate_wafer_cnn.py --max-samples 5000
 
 Requires:
     - data/raw/wm811k/LSWMD.pkl  (see README for download instructions)
     - outputs/models/wafer_cnn_best.pth  (produced by train_wafer_cnn.py)
 
-Outputs:
-    outputs/reports/wafer/evaluation_metrics.json    -- per-class metrics on test split
-    outputs/reports/wafer/confusion_matrix_test.png  -- confusion matrix on test split
-    outputs/reports/wafer/misclassified.png          -- grid of misclassified examples
+Outputs (under outputs/reports/wafer/runs/<run_id>/):
+    confusion_matrix_test.png
+    confusion_matrix_test_normalized.png
+    classification_report.csv / .json
+    evaluation_summary.json              -- includes prediction_distribution, run_id
+    evaluation_metrics.json              -- legacy per-class metrics
 
 NOTE: This is a portfolio project using the public WM-811K dataset.
       Reported metrics do not represent real fab deployment performance.
+      WM-811K has ~79% 'none' class; macro-F1 and per-class recall are
+      the meaningful metrics. Accuracy alone is misleading.
 """
 
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -42,6 +48,9 @@ from semiconductor_yield.wafer.evaluate import (
     evaluate_model,
     load_model,
     plot_confusion_matrix,
+    plot_confusion_matrix_normalized,
+    save_classification_report,
+    save_evaluation_summary,
     save_misclassified,
 )
 from semiconductor_yield.wafer.preprocess import stratified_split
@@ -66,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Limit total labeled samples (useful for quick smoke runs)")
     parser.add_argument("--misclassified", type=int, default=16,
                         help="Number of misclassified examples to plot (default: 16)")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="Run identifier for output directory. Auto-generated if not set.")
     args = parser.parse_args(argv)
 
     # ── Guards ─────────────────────────────────────────────────────────────────
@@ -129,8 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nEvaluating on {len(splits.test):,} test samples ...")
     result = evaluate_model(model, test_loader, device, class_names)
 
-    print(f"\n  Accuracy  : {result.accuracy:.4f}")
-    print(f"  Macro F1  : {result.macro_f1:.4f}")
+    print(f"\n  Accuracy          : {result.accuracy:.4f}")
+    print(f"  Macro F1          : {result.macro_f1:.4f}")
+    print(f"  Macro Precision   : {result.macro_precision:.4f}")
+    print(f"  Macro Recall      : {result.macro_recall:.4f}")
+    print(f"  Weighted F1       : {result.weighted_f1:.4f}")
     print()
     print("  Per-class metrics:")
     for name, m in result.per_class.items():
@@ -140,8 +154,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # ── Save reports ───────────────────────────────────────────────────────────
-    report_dir = Path(WAFER_REPORTS_DIR)
+    run_id = args.run_id or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    report_dir = Path(WAFER_REPORTS_DIR) / "runs" / run_id
     report_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"run_id={run_id}  reports -> {report_dir}")
 
     cm_path = report_dir / "confusion_matrix_test.png"
     plot_confusion_matrix(
@@ -150,12 +166,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     logger.info(f"Saved confusion matrix to {cm_path}")
 
+    cm_norm_path = report_dir / "confusion_matrix_test_normalized.png"
+    plot_confusion_matrix_normalized(
+        result.confusion_matrix, class_names, cm_norm_path,
+        title="Confusion Matrix Normalized (Test Split)",
+    )
+    logger.info(f"Saved normalized confusion matrix to {cm_norm_path}")
+
     misclass_path = report_dir / "misclassified.png"
     save_misclassified(
         model, test_ds, device, misclass_path,
         n_examples=args.misclassified, class_names=class_names,
     )
     logger.info(f"Saved misclassified examples to {misclass_path}")
+
+    save_classification_report(result, report_dir)
+    logger.info(f"Saved classification report to {report_dir}")
+
+    save_evaluation_summary(
+        result, report_dir, split_name="test",
+        n_samples=len(splits.test), run_id=run_id,
+    )
+    logger.info(f"Saved evaluation summary to {report_dir}")
 
     metrics = {
         "disclaimer": (
@@ -173,11 +205,18 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(metrics, f, indent=2)
     logger.info(f"Saved evaluation metrics to {metrics_path}")
 
-    print(f"\nOutputs saved to {report_dir}/")
+    print(f"\nrun_id: {run_id}")
+    print(f"Outputs saved to {report_dir}/")
     print(f"  confusion_matrix_test.png")
+    print(f"  confusion_matrix_test_normalized.png")
+    print(f"  classification_report.csv")
+    print(f"  classification_report.json")
+    print(f"  evaluation_summary.json")
     print(f"  misclassified.png")
     print(f"  evaluation_metrics.json")
     print()
+    print("NOTE: WM-811K has ~79% 'none' class -- macro-F1 and per-class recall")
+    print("      are the meaningful metrics; accuracy alone is misleading.")
     print("NOTE: This is a portfolio project using the public WM-811K dataset.")
     print("      These metrics do not represent real fab deployment performance.")
     print()

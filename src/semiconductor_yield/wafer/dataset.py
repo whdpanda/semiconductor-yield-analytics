@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
+from semiconductor_yield.config import RANDOM_SEED
 from semiconductor_yield.wafer.data_loader import WaferSample
 from semiconductor_yield.wafer.preprocess import normalize_wafer_map
 
@@ -77,22 +78,40 @@ def _random_augment(wmap: np.ndarray) -> np.ndarray:
 
 # ── Imbalance handling ─────────────────────────────────────────────────────────
 
-def make_weighted_sampler(dataset: WaferMapDataset) -> WeightedRandomSampler:
-    """Build a WeightedRandomSampler that equalises class frequency.
+def make_weighted_sampler(
+    dataset: WaferMapDataset,
+    mode: str = "sqrt_inverse",
+) -> WeightedRandomSampler:
+    """Build a WeightedRandomSampler with a configurable class-weight strategy.
 
-    Each sample receives weight 1 / class_count. The sampler draws
-    len(dataset) samples with replacement per epoch, matching the dataset
-    length so DataLoader iteration works the same as with shuffle=True.
+    Args:
+        dataset: WaferMapDataset with a .get_labels() method.
+        mode: How per-sample weights are computed from class counts:
+            - "inverse"      : weight = 1 / count   (aggressive; ~123× for WM-811K)
+            - "sqrt_inverse" : weight = 1 / sqrt(count)  (gentler default; ~11× for WM-811K)
 
-    Prefer this over loss-weight class weighting when the imbalance is
-    extreme (79% 'none' class in WM-811K), because it re-balances the
-    gradient signal rather than just scaling the loss magnitude.
+    Returns:
+        WeightedRandomSampler drawing len(dataset) samples with replacement.
+
+    Note on WM-811K:
+        "inverse" causes severe over-sampling of rare classes like Scratch (~775
+        train samples appear ~17× per epoch), which can lead to single-class
+        collapse. "sqrt_inverse" reduces the replication to ~7× while still
+        improving minority-class recall meaningfully.
     """
+    if mode not in ("inverse", "sqrt_inverse"):
+        raise ValueError(f"Unknown mode '{mode}'. Valid: 'inverse', 'sqrt_inverse'.")
+
     labels = dataset.get_labels()
     n_classes = max(labels) + 1
     counts = np.bincount(labels, minlength=n_classes).astype(float)
-    counts = np.where(counts == 0, 1.0, counts)     # avoid division by zero
-    class_weights = 1.0 / counts
+    counts = np.where(counts == 0, 1.0, counts)
+
+    if mode == "sqrt_inverse":
+        class_weights = 1.0 / np.sqrt(counts)
+    else:
+        class_weights = 1.0 / counts
+
     sample_weights = torch.tensor(
         [class_weights[lbl] for lbl in labels], dtype=torch.float32
     )
@@ -101,3 +120,39 @@ def make_weighted_sampler(dataset: WaferMapDataset) -> WeightedRandomSampler:
         num_samples=len(sample_weights),
         replacement=True,
     )
+
+
+def make_balanced_subset(
+    samples: list[WaferSample],
+    samples_per_class: int = 500,
+    seed: int = RANDOM_SEED,
+) -> list[WaferSample]:
+    """Select at most samples_per_class examples from each class.
+
+    Classes with fewer than samples_per_class samples contribute all their
+    samples. The resulting dataset is ~balanced and can be used with
+    shuffle=True instead of WeightedRandomSampler.
+
+    Args:
+        samples: Full list of training samples (pre-split).
+        samples_per_class: Maximum samples drawn from each class.
+        seed: RNG seed for reproducible selection.
+
+    Returns:
+        Balanced subset with at most samples_per_class samples per class.
+    """
+    rng = np.random.default_rng(seed)
+    by_class: dict[int, list[WaferSample]] = {}
+    for s in samples:
+        by_class.setdefault(s.label, []).append(s)
+
+    result: list[WaferSample] = []
+    for cls_idx in sorted(by_class):
+        cls_samples = by_class[cls_idx]
+        if len(cls_samples) <= samples_per_class:
+            result.extend(cls_samples)
+        else:
+            chosen = rng.choice(len(cls_samples), size=samples_per_class, replace=False)
+            result.extend(cls_samples[i] for i in chosen)
+
+    return result

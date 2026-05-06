@@ -9,6 +9,7 @@ Public API:
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,11 @@ from torch.utils.data import DataLoader
 
 from semiconductor_yield.config import MODELS_DIR, RANDOM_SEED, WAFER_DEFECT_CLASSES, WAFER_REPORTS_DIR
 from semiconductor_yield.models.wafer_cnn import WaferCNN
-from semiconductor_yield.wafer.dataset import WaferMapDataset, make_weighted_sampler
+from semiconductor_yield.wafer.dataset import (
+    WaferMapDataset,
+    make_balanced_subset,
+    make_weighted_sampler,
+)
 
 
 # ── Per-epoch loops ────────────────────────────────────────────────────────────
@@ -101,10 +106,14 @@ def fit(
     weight_decay: float = 1e-4,
     dropout: float = 0.3,
     use_weighted_sampler: bool = True,
+    class_weight_mode: str = "sqrt_inverse",
+    balanced_subset: bool = False,
+    samples_per_class: int = 500,
     device_str: str = "auto",
     output_dir: Path | str = MODELS_DIR,
     report_dir: Path | str = WAFER_REPORTS_DIR,
     class_names: list[str] | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """Train WaferCNN and save the best checkpoint (by val macro F1).
 
@@ -117,16 +126,22 @@ def fit(
         lr:            Initial Adam learning rate.
         weight_decay:  L2 regularisation coefficient.
         dropout:       Dropout probability in classifier.
-        use_weighted_sampler: If True, use WeightedRandomSampler to equalise
-            class frequency in training. Preferred over loss class-weights for
-            extreme imbalance like WM-811K's 79% 'none' class.
+        use_weighted_sampler: When True and balanced_subset=False, apply
+            WeightedRandomSampler using class_weight_mode.
+        class_weight_mode: "sqrt_inverse" (default, gentler) or "inverse"
+            (aggressive). "inverse" can cause single-class collapse on WM-811K.
+        balanced_subset: If True, sub-sample at most samples_per_class examples
+            per class and train with shuffle=True (no sampler needed).
+        samples_per_class: Max samples per class when balanced_subset=True.
         device_str:    ``"auto"`` picks CUDA if available, else CPU.
         output_dir:    Directory for model checkpoint.
-        report_dir:    Directory for training_metrics.json and confusion matrix.
+        report_dir:    Root report directory; reports are written to
+            report_dir/runs/<run_id>/.
         class_names:   Class name list, index-aligned. Defaults to WAFER_DEFECT_CLASSES.
+        run_id:        Unique run identifier. Auto-generated from datetime if None.
 
     Returns:
-        Metrics dict with keys: best_epoch, best_val_macro_f1, history, disclaimer.
+        Metrics dict with keys: run_id, best_epoch, best_val_macro_f1, history, disclaimer.
     """
     if class_names is None:
         class_names = list(WAFER_DEFECT_CLASSES)
@@ -141,8 +156,22 @@ def fit(
     logger.info(f"[WaferCNN] Training on {device}")
 
     # ── DataLoaders ───────────────────────────────────────────────────────────
-    if use_weighted_sampler:
-        sampler = make_weighted_sampler(train_dataset)
+    if balanced_subset:
+        balanced_samples = make_balanced_subset(
+            train_dataset.samples, samples_per_class, seed=RANDOM_SEED
+        )
+        logger.info(
+            f"[WaferCNN] Balanced subset: {len(balanced_samples):,} samples "
+            f"({samples_per_class}/class max from {len(train_dataset):,} available)"
+        )
+        train_dataset = WaferMapDataset(balanced_samples, augment=True)
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            generator=torch.Generator().manual_seed(RANDOM_SEED),
+        )
+    elif use_weighted_sampler and class_weight_mode != "none":
+        sampler = make_weighted_sampler(train_dataset, mode=class_weight_mode)
+        logger.info(f"[WaferCNN] WeightedRandomSampler mode={class_weight_mode}")
         train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
     else:
         train_loader = DataLoader(
@@ -150,6 +179,7 @@ def fit(
             generator=torch.Generator().manual_seed(RANDOM_SEED),
         )
 
+    n_train = len(train_dataset)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # ── Model + loss + optimizer ───────────────────────────────────────────────
@@ -160,11 +190,14 @@ def fit(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # ── Training loop ──────────────────────────────────────────────────────────
+    # ── Run ID and output directories ─────────────────────────────────────────
+    if run_id is None:
+        run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     output_dir = Path(output_dir)
-    report_dir = Path(report_dir)
+    run_report_dir = Path(report_dir) / "runs" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
-    report_dir.mkdir(parents=True, exist_ok=True)
+    run_report_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"[WaferCNN] run_id={run_id}  reports → {run_report_dir}")
 
     history: dict[str, list] = {"train": [], "val": []}
     best_val_f1 = -1.0
@@ -197,34 +230,41 @@ def fit(
         f"Checkpoint: {checkpoint_path}"
     )
 
-    # ── Confusion matrix on val set (best model) ───────────────────────────────
+    # ── Val reports on best model ──────────────────────────────────────────────
     if checkpoint_path.exists():
         model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
         model.eval()
-        _save_val_confusion_matrix(model, val_loader, device, class_names, report_dir)
+        _save_val_reports(
+            model, val_loader, device, class_names, run_report_dir,
+            run_id=run_id, n_train=n_train,
+        )
 
     # ── Save metrics ───────────────────────────────────────────────────────────
+    effective_weight_mode = class_weight_mode if (use_weighted_sampler and not balanced_subset) else "none"
     metrics = {
         "disclaimer": (
-            "Metrics on WM-811K public dataset (portfolio project — "
+            "Metrics on WM-811K public dataset (portfolio project -- "
             "not real fab production performance)."
         ),
+        "run_id": run_id,
         "training_config": {
-            "epochs":               epochs,
-            "batch_size":           batch_size,
-            "lr":                   lr,
-            "weight_decay":         weight_decay,
-            "use_weighted_sampler": use_weighted_sampler,
-            "device":               str(device),
-            "n_train":              len(train_dataset),
-            "n_val":                len(val_dataset),
+            "epochs":             epochs,
+            "batch_size":         batch_size,
+            "lr":                 lr,
+            "weight_decay":       weight_decay,
+            "balanced_subset":    balanced_subset,
+            "samples_per_class":  samples_per_class if balanced_subset else None,
+            "class_weight_mode":  effective_weight_mode,
+            "device":             str(device),
+            "n_train":            n_train,
+            "n_val":              len(val_dataset),
         },
         "best_epoch":        best_epoch,
         "best_val_macro_f1": round(best_val_f1, 4),
         "history":           history,
     }
-    metrics_path = report_dir / "training_metrics.json"
-    with open(metrics_path, "w") as f:
+    metrics_path = run_report_dir / "training_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
     logger.info(f"[WaferCNN] Metrics saved to {metrics_path}")
 
@@ -233,16 +273,41 @@ def fit(
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _save_val_confusion_matrix(
+def _save_val_reports(
     model: WaferCNN,
     val_loader: DataLoader,
     device: torch.device,
     class_names: list[str],
-    report_dir: Path,
+    run_report_dir: Path,
+    run_id: str = "",
+    n_train: int = 0,
 ) -> None:
-    from semiconductor_yield.wafer.evaluate import evaluate_model, plot_confusion_matrix
+    from semiconductor_yield.wafer.evaluate import (
+        evaluate_model,
+        plot_confusion_matrix,
+        plot_confusion_matrix_normalized,
+        save_classification_report,
+        save_evaluation_summary,
+    )
 
     result = evaluate_model(model, val_loader, device, class_names)
-    cm_path = report_dir / "confusion_matrix_val.png"
+
+    cm_path = run_report_dir / "confusion_matrix_val.png"
     plot_confusion_matrix(result.confusion_matrix, class_names, cm_path, title="Confusion Matrix (Validation)")
     logger.info(f"[WaferCNN] Confusion matrix saved to {cm_path}")
+
+    cm_norm_path = run_report_dir / "confusion_matrix_val_normalized.png"
+    plot_confusion_matrix_normalized(
+        result.confusion_matrix, class_names, cm_norm_path,
+        title="Confusion Matrix Normalized (Validation)",
+    )
+    logger.info(f"[WaferCNN] Normalized confusion matrix saved to {cm_norm_path}")
+
+    save_classification_report(result, run_report_dir)
+    logger.info(f"[WaferCNN] Classification report saved to {run_report_dir}")
+
+    save_evaluation_summary(
+        result, run_report_dir, split_name="val",
+        n_samples=len(result.y_true), run_id=run_id, n_train=n_train,
+    )
+    logger.info(f"[WaferCNN] Evaluation summary saved to {run_report_dir}")
