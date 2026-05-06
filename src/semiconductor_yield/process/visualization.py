@@ -77,13 +77,36 @@ def plot_control_chart(
         )
 
     ax.set_title(
-        f"SPC Control Chart  |  {feature}  —  {group_label}",
-        fontsize=11, fontweight="bold", pad=8,
+        f"SPC Control Chart  |  {feature}  —  {group_label}"
+        "\n[SIMULATED DATA — not real fab measurements]",
+        fontsize=10, fontweight="bold", pad=8,
     )
     ax.set_xlabel("Sample Index", fontsize=9)
     ax.set_ylabel(feature, fontsize=9)
     ax.legend(loc="upper right", fontsize=7.5, framealpha=0.85)
     ax.grid(True, alpha=0.25, linewidth=0.5)
+
+    # Footer note: SPC signals are warnings, Rule 4 context
+    n_rule4 = (
+        int((violations_df["rule"] == "Rule 4").sum())
+        if len(violations_df) > 0 and "rule" in violations_df.columns
+        else 0
+    )
+    footer = (
+        "SPC signals are process control warnings, not confirmed root causes.  "
+        "Simulated data only."
+    )
+    if n_rule4 > 0:
+        footer += (
+            f"  Rule 4 (LOW): {n_rule4} raw signal(s) — sustained drift produces "
+            "many consecutive windows; see spc_events.csv for event count."
+        )
+    ax.text(
+        0.0, -0.12, footer,
+        transform=ax.transAxes, fontsize=6.0, alpha=0.65,
+        verticalalignment="top", color="dimgray", style="italic",
+        wrap=True,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()

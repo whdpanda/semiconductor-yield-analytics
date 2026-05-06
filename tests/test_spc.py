@@ -14,6 +14,7 @@ from semiconductor_yield.process.spc import (
     ControlLimits,
     SPCViolation,
     WE_RULES,
+    _rule4_events,
     check_western_electric_rules,
     compute_control_limits,
     run_spc,
@@ -327,7 +328,90 @@ def test_run_spc_violations_df_required_columns():
     values = np.concatenate([np.zeros(15), np.full(5, 10.0)])  # large step
     df = _make_df("Etching", "temperature", values)
     viols_df, _ = run_spc(df, feature_cols=["temperature"])
-    required = {"timestamp", "feature", "process_step", "rule", "severity", "series_index"}
+    required = {
+        "timestamp", "feature", "feature_name", "process_step",
+        "rule", "rule_name", "severity", "series_index",
+        "mean", "ucl", "lcl",
+    }
+    assert required.issubset(set(viols_df.columns))
+
+
+def test_run_spc_violations_control_limit_values_correct():
+    """mean/ucl/lcl in each violation row must match limits_map for that group."""
+    values = np.concatenate([np.zeros(15), np.full(5, 10.0)])
+    df = _make_df("Etching", "temperature", values)
+    viols_df, limits_map = run_spc(df, feature_cols=["temperature"])
+    lim = limits_map[("temperature", "Etching")]
+    for _, row in viols_df.iterrows():
+        assert row["mean"] == pytest.approx(lim.mean, abs=1e-4)
+        assert row["ucl"]  == pytest.approx(lim.ucl,  abs=1e-4)
+        assert row["lcl"]  == pytest.approx(lim.lcl,  abs=1e-4)
+
+
+def test_run_spc_violations_feature_name_alias():
+    values = np.concatenate([np.zeros(15), np.full(5, 10.0)])
+    df = _make_df("Etching", "temperature", values)
+    viols_df, _ = run_spc(df, feature_cols=["temperature"])
+    assert (viols_df["feature"] == viols_df["feature_name"]).all()
+    assert (viols_df["rule"]    == viols_df["rule_name"]).all()
+
+
+# ── Rule 4 deduplication (_rule4_events) ──────────────────────────────────────
+
+def test_rule4_events_sustained_run_gives_one_event():
+    """250 consecutive above-mean points → 1 event, not 243 raw violations."""
+    values = np.concatenate([np.full(250, 0.5)])
+    viols_raw = check_western_electric_rules(values, ts(250), lim(), "x", deduplicate_rule4=False)
+    viols_evt = check_western_electric_rules(values, ts(250), lim(), "x", deduplicate_rule4=True)
+    raw_r4 = len(rule_violations(viols_raw, "Rule 4"))
+    evt_r4 = len(rule_violations(viols_evt, "Rule 4"))
+    assert raw_r4 == 250 - 7, f"Expected {250 - 7} raw Rule 4 violations, got {raw_r4}"
+    assert evt_r4 == 1, f"Expected 1 deduplicated event, got {evt_r4}"
+
+
+def test_rule4_events_two_separate_runs_give_two_events():
+    """Two separate qualifying runs → 2 events."""
+    # run above (8), gap below (1), run above (8)
+    values = np.concatenate([np.full(8, 0.5), [-0.5], np.full(8, 0.5)])
+    evts = check_western_electric_rules(values, ts(len(values)), lim(), "x", deduplicate_rule4=True)
+    assert len(rule_violations(evts, "Rule 4")) == 2
+
+
+def test_rule4_events_mean_point_breaks_run():
+    """A point exactly at the mean resets the run counter."""
+    # 7 above, exactly at mean (0.0), 8 above → the second set starts fresh
+    values = np.concatenate([np.full(7, 0.5), [0.0], np.full(8, 0.5)])
+    evts = check_western_electric_rules(values, ts(len(values)), lim(), "x", deduplicate_rule4=True)
+    assert len(rule_violations(evts, "Rule 4")) == 1
+
+
+def test_rule4_events_nan_breaks_run():
+    """A NaN resets the run counter — the run after NaN must qualify independently."""
+    values = np.concatenate([np.full(9, 0.5), [float("nan")], np.full(8, 0.5)])
+    evts = check_western_electric_rules(values, ts(len(values)), lim(), "x", deduplicate_rule4=True)
+    # First run (9 points) → 1 event; second run (8 points) → 1 event
+    assert len(rule_violations(evts, "Rule 4")) == 2
+
+
+def test_run_spc_deduplicate_reduces_rule4_count():
+    """run_spc with deduplicate_rule4=True should produce fewer Rule 4 rows than raw."""
+    # 100 consecutive above-mean points → raw = 93, events = 1
+    values = np.concatenate([np.zeros(5), np.full(100, 2.0)])
+    df = _make_df("Etching", "temperature", values)
+    viols_raw, _ = run_spc(df, feature_cols=["temperature"], deduplicate_rule4=False)
+    viols_evt, _ = run_spc(df, feature_cols=["temperature"], deduplicate_rule4=True)
+    raw_r4 = int((viols_raw["rule"] == "Rule 4").sum())
+    evt_r4 = int((viols_evt["rule"] == "Rule 4").sum())
+    assert raw_r4 > evt_r4, "Deduplicated should have fewer Rule 4 rows than raw"
+    assert evt_r4 == 1, f"Expected 1 event for one continuous run, got {evt_r4}"
+
+
+def test_run_spc_empty_violations_has_all_columns():
+    """Even when no violations occur, the DataFrame must have all required columns."""
+    rng = np.random.default_rng(0)
+    df = _make_df("Etching", "temperature", rng.normal(60.0, 0.001, 20))
+    viols_df, _ = run_spc(df, feature_cols=["temperature"])
+    required = {"mean", "ucl", "lcl", "feature_name", "rule_name"}
     assert required.issubset(set(viols_df.columns))
 
 

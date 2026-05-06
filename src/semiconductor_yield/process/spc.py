@@ -107,17 +107,28 @@ def check_western_electric_rules(
     timestamps: np.ndarray,
     limits: ControlLimits,
     feature: str,
+    deduplicate_rule4: bool = False,
 ) -> list[SPCViolation]:
     """Apply all four WE rules and return every triggered violation.
 
     Each returned SPCViolation carries the triggering point's index within
     `values`, so it can be marked directly on a control chart.
+
+    Args:
+        deduplicate_rule4: When True, uses _rule4_events instead of _rule4.
+            _rule4 fires at every index where the 8-point sliding window
+            qualifies — producing n-7 violations for a run of n consecutive
+            same-side points.  _rule4_events fires only once per distinct run,
+            at the 8th point.  Use deduplicate_rule4=True for event counting;
+            keep False (default) for chart annotation so every out-of-control
+            point is visually marked.
     """
     violations: list[SPCViolation] = []
     violations.extend(_rule1(values, timestamps, limits, feature))
     violations.extend(_rule2(values, timestamps, limits, feature))
     violations.extend(_rule3(values, timestamps, limits, feature))
-    violations.extend(_rule4(values, timestamps, limits, feature))
+    rule4_fn = _rule4_events if deduplicate_rule4 else _rule4
+    violations.extend(rule4_fn(values, timestamps, limits, feature))
     return violations
 
 
@@ -126,6 +137,7 @@ def run_spc(
     feature_cols: list[str],
     timestamp_col: str = "timestamp",
     group_col: str | None = "process_step",
+    deduplicate_rule4: bool = False,
 ) -> tuple[pd.DataFrame, dict[tuple[str, str], ControlLimits]]:
     """Run SPC across all features, optionally grouped by process step.
 
@@ -168,17 +180,25 @@ def run_spc(
             limits = compute_control_limits(values)
             limits_map[(feature, group_key)] = limits
 
-            for v in check_western_electric_rules(values, timestamps, limits, feature):
+            for v in check_western_electric_rules(
+                values, timestamps, limits, feature,
+                deduplicate_rule4=deduplicate_rule4,
+            ):
                 all_violations.append(
                     {
-                        "timestamp": v.timestamp,
-                        "feature": v.feature,
-                        "process_step": group_key,
-                        "rule": v.rule,
+                        "timestamp":       v.timestamp,
+                        "feature":         v.feature,
+                        "feature_name":    v.feature,           # alias for spec compliance
+                        "process_step":    group_key,
+                        "rule":            v.rule,
+                        "rule_name":       v.rule,              # alias for spec compliance
                         "rule_description": v.rule_description,
-                        "value": round(float(v.value), 6),
-                        "severity": v.severity,
-                        "series_index": v.index,
+                        "value":           round(float(v.value), 6),
+                        "severity":        v.severity,
+                        "mean":            round(limits.mean, 6),
+                        "ucl":             round(limits.ucl, 6),
+                        "lcl":             round(limits.lcl, 6),
+                        "series_index":    v.index,
                     }
                 )
 
@@ -191,8 +211,9 @@ def run_spc(
     else:
         violations_df = pd.DataFrame(
             columns=[
-                "timestamp", "feature", "process_step", "rule",
-                "rule_description", "value", "severity", "series_index",
+                "timestamp", "feature", "feature_name", "process_step",
+                "rule", "rule_name", "rule_description",
+                "value", "severity", "mean", "ucl", "lcl", "series_index",
             ]
         )
 
@@ -284,7 +305,13 @@ def _rule4(
     limits: ControlLimits,
     feature: str,
 ) -> list[SPCViolation]:
-    """Eight consecutive points on same side of center line."""
+    """Eight consecutive points on same side of center line.
+
+    Fires once per sliding window that qualifies.  A sustained run of n
+    same-side points produces n-7 violations — use _rule4_events when
+    counting distinct drift events rather than marking every out-of-control
+    point on a chart.
+    """
     result = []
     n = len(values)
     for i in range(7, n):
@@ -293,4 +320,58 @@ def _rule4(
             continue
         if np.all(w > limits.mean) or np.all(w < limits.mean):
             result.append(_viol(i, values, timestamps, feature, "Rule 4"))
+    return result
+
+
+def _rule4_events(
+    values: np.ndarray,
+    timestamps: np.ndarray,
+    limits: ControlLimits,
+    feature: str,
+) -> list[SPCViolation]:
+    """Rule 4 (deduplicated): one SPCViolation per distinct qualifying run.
+
+    Fires at the 8th consecutive same-side point of each new run and does NOT
+    re-fire for extensions of that run.  A run resets when a point falls
+    exactly on the mean, a NaN appears, or the side flips.
+
+    This avoids the inflated counts produced by _rule4 when a sustained drift
+    keeps the process on one side of the center line for many consecutive points
+    (e.g. a 250-point drift yields 243 raw Rule 4 violations but only 1 event).
+    """
+    result: list[SPCViolation] = []
+    run_len = 0
+    run_above: bool | None = None
+    event_fired = False
+
+    for i, v in enumerate(values):
+        if np.isnan(v):
+            run_len = 0
+            run_above = None
+            event_fired = False
+            continue
+
+        current_above = v > limits.mean
+        current_below = v < limits.mean
+
+        if not (current_above or current_below):
+            # Exactly at mean — breaks any run
+            run_len = 0
+            run_above = None
+            event_fired = False
+            continue
+
+        current_side = current_above  # True = above, False = below
+
+        if run_above is None or current_side != run_above:
+            run_len = 1
+            run_above = current_side
+            event_fired = False
+        else:
+            run_len += 1
+
+        if run_len >= 8 and not event_fired:
+            result.append(_viol(i, values, timestamps, feature, "Rule 4"))
+            event_fired = True  # suppress further fires until run breaks
+
     return result

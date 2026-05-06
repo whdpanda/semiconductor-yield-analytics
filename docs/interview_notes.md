@@ -202,6 +202,65 @@ original data provider.
 
 ---
 
+## Rule 4 Counts and Sustained Drift — How to Interpret
+
+### Why total_violations is high (3253 for 6250 rows)
+
+The synthetic dataset contains an intentional temperature drift of up to +6 °C over the
+last 20 % of lots (10 lots × 25 wafers = 250 measurements per process step).  The result
+by process step:
+
+| Step | Nominal temp | Std | Drift magnitude | Drift in σ |
+|------|-------------|-----|----------------|-----------|
+| Lithography | 23 °C | 0.30 °C | +6 °C | +20σ |
+| Metrology | 23 °C | 0.50 °C | +6 °C | +12σ |
+| CMP | 25 °C | 2.0 °C | +6 °C | +3σ |
+| Etching | 60 °C | 3.0 °C | +6 °C | +2σ |
+| Deposition | 400 °C | 8.0 °C | +6 °C | +0.75σ |
+
+Lithography and Metrology have the tightest tolerances (climate-controlled environments).
+A +6 °C drift that would be a minor nuisance at Etching is a catastrophic +20σ excursion at Lithography.
+
+### Why Rule 4 fires so many times for one drift
+
+Rule 4 uses a sliding window of 8 points.  It fires at every index i where window
+[i-7, i] contains 8 consecutive same-side points.  A sustained run of N consecutive
+same-side points produces N-7 raw violations:
+
+    250 consecutive above-mean points → 243 raw Rule 4 violations
+
+This is correct WE Rule implementation behavior — every index in the drift region is
+genuinely "out of control" per Rule 4.  For root-cause counting purposes, however,
+what matters is the number of distinct drift events, not the number of qualifying windows.
+
+**Raw violation count** (spc_violations.csv, 3253 rows) — every qualifying window, useful
+for annotating control charts with all out-of-control points.
+
+**Event count** (spc_events.csv, fewer rows) — one entry per distinct qualifying run,
+useful for counting how many drift episodes occurred.  Rule 4 events = distinct runs of
+8+ consecutive same-side points; Rules 1-3 are inherently point-based (same in both files).
+
+### In an interview
+
+> "The 3253 violations are not 3253 independent problems — they are the expected output
+> from a dataset that intentionally contains multi-hundred-point temperature drifts.
+> Rule 4 fires once per 8-point window, so a 250-point drift produces ~243 Rule 4 rows
+> for a single root cause.  The spc_events.csv deduplicates this:  it shows one row per
+> distinct qualifying run, which is the number you'd report to the shift engineer.
+> I chose to preserve both views — raw counts for chart annotation, event counts for
+> reporting — rather than silently suppress the violations."
+
+### Demonstrating data honesty
+
+Silencing or hiding the high violation count would be a mistake.  The correct response is:
+1. Report it as-is in the raw output (spc_violations.csv)
+2. Explain it clearly (spc_summary.json → note_for_rule4)
+3. Provide the deduplicated view (spc_events.csv)
+4. Document it here so an interviewer who asks "why are there 3253 violations?" gets a
+   precise, technically correct answer about sliding-window semantics and drift magnitude
+
+---
+
 ## Limitations to acknowledge proactively
 
 1. All results are on simulated or public dataset data — not validated in a real fab environment.
